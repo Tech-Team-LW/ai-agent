@@ -42,7 +42,7 @@ def choose_pod(namespace):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Investigate a Kubernetes pod and create a Markdown report."
+        description="Investigate a Kubernetes pod and create a Markdown RCA report."
     )
     parser.add_argument("--pod", help="Exact pod name (leave out to choose from a list)")
     parser.add_argument("--namespace", default="ai-sre-lab", help="Kubernetes namespace")
@@ -76,7 +76,7 @@ def main():
     print("\n[4/5] Reading CPU/RAM with LangChain tool...")
     print(read_pod_cpu_ram.invoke({"pod_name": pod_name, "namespace": namespace}))
 
-    print("\n[5/5] Collecting full evidence and asking Claude for an explanation...")
+    print("\n[5/5] Collecting full evidence and asking Claude for a root cause analysis...")
     evidence = collect_pod_evidence(pod_name, namespace)
     explanation = explain_incident(evidence)
     report_path = create_markdown_report(

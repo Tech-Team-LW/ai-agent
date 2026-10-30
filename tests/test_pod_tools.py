@@ -181,3 +181,64 @@ def test_missing_api_key_gives_clear_message(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "replace_with_your_real_key")
     message = claude_client.explain_incident({"pod": {}})
     assert "AI explanation unavailable" in message
+
+
+# ---------- RCA tests ----------
+
+def test_last_state_is_recorded_for_restarted_container(monkeypatch):
+    pod = json.loads(fake_pod_json("crashloop-demo", "Running", ready=False,
+                                   waiting_reason="CrashLoopBackOff"))
+    pod["status"]["containerStatuses"][0]["restartCount"] = 4
+    pod["status"]["containerStatuses"][0]["lastState"] = {
+        "terminated": {"exitCode": 1, "reason": "Error"}
+    }
+    monkeypatch.setattr(
+        pod_tools, "run_kubectl",
+        lambda args, timeout=20: {"ok": True, "output": json.dumps(pod)}
+    )
+    status = get_pod_status("crashloop-demo", "ai-sre-lab")
+    container = status["containers"][0]
+    assert container["waiting_reason"] == "CrashLoopBackOff"
+    assert container["restart_count"] == 4
+    assert container["last_state"]["terminated"]["exitCode"] == 1
+
+
+def test_previous_logs_error_is_reported(monkeypatch):
+    calls = []
+
+    def fake_run(args, timeout=20):
+        calls.append(args)
+        return {"ok": False, "error": 'previous terminated container "web" not found'}
+
+    monkeypatch.setattr(pod_tools, "run_kubectl", fake_run)
+    result = pod_tools.get_pod_previous_logs("demo-web-abc", "ai-sre-lab")
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+    assert "--previous" in calls[0]
+
+
+def test_prompt_asks_for_rca_sections():
+    prompt = claude_client.build_prompt({"pod": {"phase": "Pending"}})
+    for section in ["Executive summary", "Timeline (UTC)", "Root cause",
+                    "Five whys", "Corrective actions", "Preventive actions",
+                    "Confidence level and evidence gaps"]:
+        assert section in prompt
+    assert '"phase": "Pending"' in prompt
+
+
+def test_report_contains_rca_and_previous_logs(tmp_path, monkeypatch):
+    monkeypatch.setenv("REPORT_DIR", str(tmp_path))
+    evidence = {
+        "pod": {"phase": "Running"},
+        "metrics": {"ok": True, "cpu_ram": "web 1m 2Mi"},
+        "previous_logs": {"ok": True, "logs": "ERROR: config file not found"},
+    }
+    path = create_markdown_report(
+        "crashloop-demo", "ai-sre-lab", evidence, "### 6. Root cause\nBad config."
+    )
+    content = open(path, encoding="utf-8").read()
+    assert "Root Cause Analysis (RCA) Report" in content
+    assert "## Previous container logs" in content
+    assert "ERROR: config file not found" in content
+    assert "## Root cause analysis (AI-generated, advisory)" in content
+    assert "Bad config." in content

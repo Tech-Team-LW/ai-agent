@@ -6,7 +6,7 @@ This guide explains **what** we are building and **how** we build it, from an em
 
 Everything in this README is based on the actual files in this project. Where the project and the original manual (`agent/manual.docs`) are different, this README follows the **current code** and says so clearly. See [Appendix A](#appendix-a--differences-between-manualdocs-and-the-current-code) and [Appendix B](#appendix-b--known-gaps-and-items-not-implemented).
 
-**How the outputs in this guide were produced:** The cluster, HTTPD application, agent runs, and reports shown in Phases 2 and 8 were recorded from a real run of this project on RHEL 10.0 (k3d v5.9.0, k3s v1.35.5, Python 3.12.9) on 30–31 October 2026. Pod names, IPs, ages, and timestamps will be different on your machine. Outputs marked **illustrative** were not recorded and only show the expected shape. During the recorded run, no Claude API key was configured, so the real reports show the "AI explanation unavailable" message; the AI analysis example in Phase 6 is illustrative.
+**How the outputs in this guide were produced:** The cluster, HTTPD application, agent runs, and reports shown in Phases 2 and 8 were recorded from a real run of this project on RHEL 10.0 (k3d v5.9.0, k3s v1.35.5, Python 3.12.9) on 30–31 October 2026. Pod names, IPs, ages, and timestamps will be different on your machine. Outputs marked **illustrative** were not recorded and only show the expected shape. The first recorded runs had no Claude API key configured, so those reports show the "AI explanation unavailable" message. The runs were then repeated with a valid key, and Phases 6 and 8 include Claude's real (shortened) analysis.
 
 ---
 
@@ -21,7 +21,7 @@ Everything in this README is based on the actual files in this project. Where th
 - [Phase 3 — Create the Python Project](#phase-3--create-the-python-project)
 - [Phase 4 — Build the Kubernetes Diagnostic Tools](#phase-4--build-the-kubernetes-diagnostic-tools)
 - [Phase 5 — Connect the Agent with Claude AI](#phase-5--connect-the-agent-with-claude-ai)
-- [Phase 6 — Generate the Incident Report](#phase-6--generate-the-incident-report)
+- [Phase 6 — Generate the Incident and RCA Report](#phase-6--generate-the-incident-and-rca-report)
 - [Phase 7 — Connect Everything Through main.py](#phase-7--connect-everything-through-mainpy)
 - [Phase 8 — Testing and Real Incident Investigation](#phase-8--testing-and-real-incident-investigation)
 - [Troubleshooting](#troubleshooting)
@@ -65,14 +65,14 @@ We build a **Python-based agent** that automates this investigation. With one co
 
 1. Connects to a Kubernetes cluster using Python and `kubectl`.
 2. Collects Pod information (phase, node, IP, labels, owner).
-3. Checks Pod and container status (ready, restart count, waiting reason).
-4. Collects container logs.
-5. Reads Kubernetes events for the Pod.
+3. Checks Pod and container status (ready, restart count, waiting reason, and the previous container's exit reason).
+4. Collects container logs, including logs from the previous run of a crashed container.
+5. Reads Kubernetes events for the Pod, with absolute timestamps.
 6. Collects live CPU and RAM usage when Kubernetes metrics are available.
 7. Reads the configured CPU and memory requests and limits from the Pod spec.
 8. Sends all the collected evidence to Claude AI.
-9. Asks Claude to analyse the evidence and separate confirmed facts from possible causes.
-10. Generates a detailed Markdown incident report.
+9. Asks Claude to write a **Root Cause Analysis (RCA)**: summary, impact, timeline, confirmed observations, root cause, contributing factors, five whys, corrective and preventive actions, verification steps, and confidence level.
+10. Generates a detailed Markdown incident and RCA report.
 11. Saves the report in the project's `reports/` directory.
 
 ### What the agent does **not** do
@@ -87,7 +87,7 @@ Claude's analysis is **advisory**. A human engineer must review the report and d
 
 ### One-line summary
 
-> Kubernetes supplies the facts. Python collects and records them. Claude explains them. You decide what to do next.
+> Kubernetes supplies the facts. Python collects and records them. Claude writes the root cause analysis from them. You decide what to do next.
 
 ---
 
@@ -147,7 +147,7 @@ Each technology below is explained in four parts: what it is, why we need it, ho
 ### Claude AI and the Claude API
 
 - **What it is:** Claude is a large language model built by Anthropic. The **Claude API** is the HTTPS interface that lets programs send text to Claude and receive a response. The `anthropic` Python package is the official client for this API.
-- **Why we need it:** Raw Kubernetes output is long and technical. Claude reads all the evidence together and writes a structured explanation: summary, confirmed observations, possible causes, next checks, and confidence level.
+- **Why we need it:** Raw Kubernetes output is long and technical. Claude reads all the evidence together and writes a structured Root Cause Analysis: summary, impact, timeline, confirmed observations, root cause, five whys, corrective and preventive actions, and confidence level.
 - **How it works here:** `claude_client.py` builds a prompt that contains strict rules and the evidence as JSON. It calls `client.messages.create(...)` and returns Claude's text.
 - **Where we use it:** Phase 5. An API key and a model ID are required (set in `.env`).
 
@@ -219,8 +219,8 @@ This is a deliberate safety choice. Claude never receives shell access and never
 1. You run `python main.py --pod <name> --namespace ai-sre-lab`. If you leave out `--pod`, the program lists the Pods and asks you to choose one.
 2. `main.py` validates the names so that only safe Kubernetes-style names reach `kubectl`.
 3. `main.py` calls four LangChain tools (`inspect_pod`, `read_pod_logs`, `read_pod_events`, `read_pod_cpu_ram`) and prints their results. If the Pod cannot be inspected, the program stops here and **no report is created**.
-4. `main.py` calls `collect_pod_evidence()`, which gathers status, metrics, events, logs, and `describe` output into one Python dictionary.
-5. `claude_client.explain_incident()` sends this evidence to Claude and returns the analysis text, or a clear "AI explanation unavailable" message.
+4. `main.py` calls `collect_pod_evidence()`, which gathers status (including the previous container state), metrics, events, current logs, previous logs, and `describe` output into one Python dictionary.
+5. `claude_client.explain_incident()` sends this evidence to Claude and returns the Root Cause Analysis text, or a clear "AI explanation unavailable" message.
 6. `reporting.create_markdown_report()` writes the evidence and the analysis into a Markdown file in `reports/`.
 7. `main.py` prints the report path.
 
@@ -259,10 +259,11 @@ agent/
 │
 ├── k8s/
 │   ├── demo.yaml           ← healthy HTTPD Deployment + Service (demo-web)
-│   └── broken-pod.yaml     ← deliberately broken Pod (invalid image tag)
+│   ├── broken-pod.yaml     ← deliberately broken Pod (invalid image tag)
+│   └── crashloop-pod.yaml  ← deliberately crashing Pod (CrashLoopBackOff)
 │
 ├── tests/
-│   └── test_pod_tools.py   ← automated tests (13 test cases)
+│   └── test_pod_tools.py   ← automated tests (17 test cases)
 │
 └── reports/
     └── .gitkeep            ← keeps the empty folder in Git; reports are written here
@@ -288,6 +289,7 @@ agent/
 | `agent/reporting.py` | Report layer | Turns evidence and analysis into a Markdown file | `main.py`, tests |
 | `agent/k8s/demo.yaml` | Healthy workload | Apache HTTPD Deployment and Service; gives us a working Pod to investigate | `kubectl apply` |
 | `agent/k8s/broken-pod.yaml` | Broken workload | Gives us a realistic `ImagePullBackOff` incident | `kubectl apply` |
+| `agent/k8s/crashloop-pod.yaml` | Crashing workload | Gives us a realistic `CrashLoopBackOff` incident for RCA testing | `kubectl apply` |
 | `agent/tests/test_pod_tools.py` | Tests | Verifies parsing, reporting, validation, and error handling | pytest |
 | `agent/reports/` | Output folder | Generated incident reports are saved here | `reporting.py` |
 
@@ -397,7 +399,7 @@ Successful results:
 - `hello-world` prints `Hello from Docker!`.
 - `docker ps` prints a header line (and possibly no containers).
 
-**Optional — run Docker without `sudo`:**
+**Required if you are not logged in as root — run Docker without `sudo`:**
 
 ```bash
 sudo usermod -aG docker $USER
@@ -406,6 +408,13 @@ docker ps
 ```
 
 > Membership in the `docker` group gives root-equivalent power on the host. Only do this on a lab machine.
+
+**Why this matters:** From Phase 2 onward, run `k3d`, `kubectl`, and `python` as your **normal user, without `sudo`**. There are two reasons:
+
+1. On RHEL, `sudo` uses a restricted `PATH` (`/sbin:/bin:/usr/sbin:/usr/bin`) that does **not** include `/usr/local/bin`. So `sudo k3d ...` or `sudo kubectl ...` fails with `command not found`.
+2. k3d writes the cluster credentials to the kubeconfig of the user who ran it. If you create the cluster as root, your normal user's `kubectl` (and therefore the agent) cannot connect.
+
+If you work as `root` (as in the recorded run for this guide), you can skip the group change.
 
 **If it fails:** See [Docker service not running](#1-docker-service-not-running).
 
@@ -763,6 +772,12 @@ kubectl run curl-test --rm -i --restart=Never --image=busybox:1.36 -n ai-sre-lab
 
 This starts a temporary BusyBox Pod, fetches `http://demo-web` using the Service name, prints the same "It works!" page, and then deletes the temporary Pod (`--rm`).
 
+`wget` finishes very quickly, so `kubectl` may also print messages like `If you don't see a command prompt, try pressing enter.` and `warning: couldn't attach to pod/curl-test, falling back to streaming logs`. These are harmless; the page is still printed and the Pod is still deleted (`pod "curl-test" deleted`). Do not pipe this command into `head` or press `Ctrl+C` early, because that stops `kubectl` before it can delete the Pod. If a `curl-test` Pod is left behind, remove it:
+
+```bash
+kubectl delete pod curl-test -n ai-sre-lab --ignore-not-found
+```
+
 **Check the configured resources and live usage:**
 
 ```bash
@@ -790,6 +805,17 @@ If `kubectl top` says `metrics not available yet`, wait a minute and try again.
 ### Why Python?
 
 Python is readable, has an official Anthropic SDK and LangChain support, and has a standard `subprocess` module to run `kubectl`. These three things are all this project needs.
+
+### How to create the files in this guide
+
+Every file in this guide is introduced with its exact path, for example **File: `agent/pod_tools.py`**. `agent/` means your project folder, `~/agent`. To create a file, open it in an editor, paste the **complete** code block shown under that heading, and save:
+
+```bash
+cd ~/agent
+vim pod_tools.py        # paste the code, then save with :wq
+```
+
+Copy the code blocks exactly. Python depends on indentation, so do not change the spaces at the start of lines. If your editor auto-indents pasted text, use `:set paste` in vim before pasting.
 
 ### Step 3.1 — Create folders and the virtual environment
 
@@ -1057,7 +1083,8 @@ def get_pod_status(pod_name, namespace=DEFAULT_NAMESPACE):
             "ready": item.get("ready", False),
             "restart_count": item.get("restartCount", 0),
             "waiting_reason": waiting_reason,
-            "state": state
+            "state": state,
+            "last_state": item.get("lastState", {})
         })
 
     return {
@@ -1085,11 +1112,30 @@ def get_pod_logs(pod_name, namespace=DEFAULT_NAMESPACE, tail=80):
     return {"ok": True, "logs": result["output"] or "(No log lines returned)"}
 
 
+def get_pod_previous_logs(pod_name, namespace=DEFAULT_NAMESPACE, tail=80):
+    """Read logs from the previous (crashed or restarted) container instance."""
+    result = run_kubectl([
+        "logs", pod_name, "-n", namespace, "--all-containers=true",
+        "--previous", f"--tail={int(tail)}"
+    ])
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "note": "No previous container logs. This is normal if the container "
+                    "has never restarted or never started.",
+            "error": result["error"]
+        }
+    return {"ok": True, "logs": result["output"] or "(No log lines returned)"}
+
+
 def get_pod_events(pod_name, namespace=DEFAULT_NAMESPACE):
     result = run_kubectl([
         "get", "events", "-n", namespace,
         "--field-selector", f"involvedObject.name={pod_name}",
-        "--sort-by=.lastTimestamp", "-o", "wide"
+        "--sort-by=.lastTimestamp",
+        "-o", "custom-columns=FIRST_SEEN:.firstTimestamp,LAST_SEEN:.lastTimestamp,"
+              "COUNT:.count,TYPE:.type,REASON:.reason,SOURCE:.source.component,"
+              "MESSAGE:.message"
     ])
     if not result["ok"]:
         return result
@@ -1127,6 +1173,7 @@ def collect_pod_evidence(pod_name, namespace=DEFAULT_NAMESPACE):
         "metrics": get_pod_metrics(pod_name, namespace),
         "events": get_pod_events(pod_name, namespace),
         "logs": get_pod_logs(pod_name, namespace),
+        "previous_logs": get_pod_previous_logs(pod_name, namespace),
         "description": get_pod_description(pod_name, namespace)
     }
 ```
@@ -1188,7 +1235,8 @@ The main "Pod information" and "Pod status" function.
 - **Does:**
   1. Returns the error dictionary if `kubectl` fails (for example, `pods "x" not found`).
   2. Parses the JSON. If it is not valid JSON, returns a clear error.
-  3. For each entry in `status.containerStatuses`, records the container name, `ready`, `restart_count`, the full `state` object, and `waiting_reason` (for example `ImagePullBackOff`, `ErrImagePull`, or `CrashLoopBackOff`; an empty string if the container is not waiting).
+  3. For each entry in `status.containerStatuses`, records the container name, `ready`, `restart_count`, the full current `state` object, `waiting_reason` (for example `ImagePullBackOff`, `ErrImagePull`, or `CrashLoopBackOff`; an empty string if the container is not waiting), and `last_state`.
+  4. `last_state` comes from `lastState` in the Pod JSON. It describes the **previous** container run, for example `{"terminated": {"exitCode": 1, "reason": "Error"}}` or `"reason": "OOMKilled"`. It is empty if the container has never restarted. This is key evidence for an RCA of a crashing Pod.
 - **Returns:** a dictionary with these keys:
 
   | Key | Source in Pod JSON | Default if missing |
@@ -1215,14 +1263,33 @@ The main "Pod information" and "Pod status" function.
   - `--tail=80` returns only the last 80 lines. `int(tail)` makes sure the value is a number.
 - **Returns:** `{"ok": True, "logs": "<lines>"}`, or `"(No log lines returned)"` if the container wrote nothing, or the error dictionary.
 - **Important:** If the container never started (for example, image pull failure), `kubectl logs` fails. The error text (for example `container "web" in pod "broken-image-demo" is waiting to start: trying and failing to pull image`) is shown in the report instead of logs. This is real evidence too.
-- **Limitation:** It reads logs of the **current** container instance only. It does not use `--previous`, so for `CrashLoopBackOff` you may need to run `kubectl logs <pod> -n <ns> --previous` yourself.
+- It reads logs of the **current** container instance. Logs of the previous instance are read by `get_pod_previous_logs()`.
+
+### Function: `get_pod_previous_logs(pod_name, namespace, tail=80)`
+
+- **Why:** When a container crashes and restarts, the useful error message is often in the logs of the **previous** run, not the new one. An RCA of a `CrashLoopBackOff` Pod needs these logs.
+- **Executes:** `kubectl logs <name> -n <ns> --all-containers=true --previous --tail=80`.
+- **Returns on success:** `{"ok": True, "logs": "<lines>"}`.
+- **Returns on failure:**
+
+  ```python
+  {"ok": False,
+   "note": "No previous container logs. This is normal if the container has never restarted or never started.",
+   "error": "<the real kubectl error>"}
+  ```
+
+- **When it fails (normal cases):**
+  - The container never restarted: `previous terminated container "web" in pod "..." not found`.
+  - Timing: while a crashed container is waiting for its next restart, Kubernetes may have already removed the older run, and `kubectl` says `unable to retrieve container logs for containerd://...`. In that situation, the **current** logs (from `get_pod_logs()`) already show the last crash output. That's why the agent collects both.
 
 ### Function: `get_pod_events(pod_name, namespace)`
 
-- **Executes:** `kubectl get events -n <ns> --field-selector involvedObject.name=<pod> --sort-by=.lastTimestamp -o wide`.
+- **Executes:** `kubectl get events -n <ns> --field-selector involvedObject.name=<pod> --sort-by=.lastTimestamp -o custom-columns=...`.
   - `--field-selector` keeps only events about this Pod.
   - `--sort-by=.lastTimestamp` puts the newest events last.
-  - `-o wide` adds extra columns (source, first seen, count).
+  - `-o custom-columns=` prints these columns: `FIRST_SEEN`, `LAST_SEEN`, `COUNT`, `TYPE`, `REASON`, `SOURCE`, `MESSAGE`.
+- **Why custom columns:** The default output shows relative ages such as `29m`. An RCA needs a **timeline**, so the agent records **absolute UTC timestamps** (for example `2026-10-30T22:38:35Z`). `FIRST_SEEN` and `LAST_SEEN` with `COUNT` show when a repeated event started, when it last happened, and how often.
+- **Note on `<nil>`:** Some events (for example `Scheduled` from the scheduler) store their time in a different field, so `FIRST_SEEN` and `LAST_SEEN` show `<nil>`. Claude is told to use only timestamps that exist, so it writes "Not recorded" for those.
 - **Returns:** `{"ok": True, "events": "<table>"}`, or `"(No events returned)"` when there are none, or the error dictionary.
 - **Note:** Kubernetes deletes old events after a retention period (one hour by default). For an older, stable Pod, "(No events returned)" is normal.
 
@@ -1249,7 +1316,7 @@ The main "Pod information" and "Pod status" function.
 
 ### Function: `collect_pod_evidence(pod_name, namespace)`
 
-- **Does:** calls the five collection functions and puts the results in one dictionary.
+- **Does:** calls the six collection functions and puts the results in one dictionary.
 - **Returns:**
 
   ```python
@@ -1258,8 +1325,9 @@ The main "Pod information" and "Pod status" function.
       "pod": {...},          # get_pod_status()
       "metrics": {...},      # get_pod_metrics()
       "events": {...},       # get_pod_events()
-      "logs": {...},         # get_pod_logs()
-      "description": {...}   # get_pod_description()
+      "logs": {...},          # get_pod_logs()
+      "previous_logs": {...}, # get_pod_previous_logs()
+      "description": {...}    # get_pod_description()
   }
   ```
 
@@ -1316,7 +1384,7 @@ Illustrative output (your Pod name and values will differ; the second line uses 
 
 ## Phase 5 — Connect the Agent with Claude AI
 
-**Goal:** Wrap the diagnostic functions as LangChain tools and send the collected evidence to Claude for analysis.
+**Goal:** Wrap the diagnostic functions as LangChain tools and send the collected evidence to Claude, which writes the Root Cause Analysis.
 
 ### Key ideas
 
@@ -1435,18 +1503,47 @@ PLACEHOLDER_KEY = "replace_with_your_real_key"
 
 def build_prompt(evidence):
     return f"""
-You are a careful DevOps incident investigator.
+You are a careful Site Reliability Engineer writing a Root Cause Analysis (RCA)
+for one Kubernetes pod.
 Use only the evidence below. Do not invent CPU, RAM, timestamps, or events.
 "metrics" is live usage from kubectl top. "configured_resources" are requests
 and limits from the pod spec. Never present a request or limit as actual usage.
 If CPU/RAM metrics are unavailable, say so.
+"last_state" and "previous_logs" describe the previous container run (for
+example an OOMKilled or crashed container). Use them when the pod restarted.
+Event times in "events" are absolute UTC timestamps; use them for the timeline.
 
-Write these sections in Markdown:
-1. Incident summary
-2. Confirmed observations (facts directly visible in the evidence)
-3. Possible causes (hypotheses, clearly labelled as not yet confirmed)
-4. Recommended next checks (read-only commands first)
-5. Confidence level (low, medium, or high) and why
+Write the RCA in Markdown with exactly these sections, using level-3 headings
+(###), so it fits inside the report:
+### 1. Executive summary
+Two or three sentences: what failed, the root cause, and the current state.
+### 2. Problem statement
+Pod, namespace, node, symptom, and when it was first observed.
+### 3. Impact
+What is affected according to the evidence (for example: container never
+started, no logs, restarts). Say "unknown" for anything the evidence cannot show.
+### 4. Timeline (UTC)
+A table of events in time order, taken only from timestamps in the evidence.
+### 5. Confirmed observations
+Facts directly visible in the evidence.
+### 6. Root cause
+Label it "Confirmed root cause" only if the evidence directly proves it.
+Otherwise label it "Most likely root cause (not confirmed)" and say what is
+missing. If the pod is healthy and shows no failure, write "No incident
+detected" and explain why; do not invent a root cause.
+### 7. Contributing factors
+Configuration or conditions that made the problem possible or worse.
+### 8. Five whys
+A short chain from the symptom to the root cause. Stop where the evidence ends.
+### 9. Corrective actions
+Immediate fix steps for a human to review and run. Mark each as
+"not performed by the agent; requires human approval".
+### 10. Preventive actions
+Changes that would stop this from happening again.
+### 11. Verification steps
+Read-only commands to confirm the fix worked.
+### 12. Confidence level and evidence gaps
+Low, medium, or high, and why. List evidence that would raise confidence.
 
 Do not claim you changed the cluster.
 
@@ -1513,15 +1610,39 @@ def explain_incident(evidence):
 
   | Prompt part | Why it is there |
   |---|---|
-  | "You are a careful DevOps incident investigator." | Sets the role and tone. |
+  | "You are a careful Site Reliability Engineer writing a Root Cause Analysis (RCA)..." | Sets the role and the type of document. |
   | "Use only the evidence below. Do not invent CPU, RAM, timestamps, or events." | Prevents made-up values. |
   | Explanation of `metrics` vs `configured_resources` | Prevents Claude from presenting a limit as usage. |
   | "If CPU/RAM metrics are unavailable, say so." | Forces honest handling of missing data. |
-  | Five required sections | Gives every report the same structure: summary, **confirmed observations**, **possible causes** (labelled as hypotheses), recommended read-only checks, confidence level. |
+  | Explanation of `last_state` and `previous_logs` | Tells Claude where to find evidence about earlier crashes (exit code, OOMKilled, last error lines). |
+  | "Event times ... are absolute UTC timestamps; use them for the timeline." | Builds the RCA timeline from real times only. |
+  | Twelve required sections with `###` headings | Gives every RCA the same structure (see the table below). The `###` level fits under the report's `##` heading. |
+  | "Confirmed root cause" only if the evidence proves it; otherwise "Most likely root cause (not confirmed)" | Stops the AI from overstating its certainty. |
+  | "If the pod is healthy ... write 'No incident detected' ... do not invent a root cause." | Prevents a made-up RCA for a healthy Pod. |
+  | Corrective actions marked "not performed by the agent; requires human approval" | Makes the read-only boundary explicit in the RCA itself. |
   | "Do not claim you changed the cluster." | Matches the read-only design. |
   | `EVIDENCE JSON:` + `json.dumps(evidence, indent=2)` | The complete evidence, formatted for readability. |
 
-- The full evidence is sent, including the complete `describe` output and logs (up to 80 lines). It is not truncated.
+- The full evidence is sent, including the complete `describe` output, current logs, and previous logs (up to 80 lines each). It is not truncated.
+
+**The twelve RCA sections Claude is asked to write:**
+
+| # | Section | What it contains |
+|---|---|---|
+| 1 | Executive summary | Two or three sentences: what failed, the root cause, the current state |
+| 2 | Problem statement | Pod, namespace, node, symptom, first observed time |
+| 3 | Impact | What is affected according to the evidence; "unknown" where the evidence cannot show it |
+| 4 | Timeline (UTC) | A table of events in time order, from real timestamps only |
+| 5 | Confirmed observations | Facts directly visible in the evidence |
+| 6 | Root cause | "Confirmed root cause", "Most likely root cause (not confirmed)", or "No incident detected" |
+| 7 | Contributing factors | Configuration or conditions that made the problem possible or worse |
+| 8 | Five whys | A chain from symptom to root cause, stopping where the evidence ends |
+| 9 | Corrective actions | Immediate fix steps for a human, each marked "not performed by the agent; requires human approval" |
+| 10 | Preventive actions | Changes that stop it from happening again |
+| 11 | Verification steps | Read-only commands to confirm the fix |
+| 12 | Confidence level and evidence gaps | Low / medium / high, and what evidence would raise confidence |
+
+> The sections are requested in the prompt but not enforced by code. Claude follows them very consistently, but the wording and level of detail differ on every run.
 
 #### Function: `explain_incident(evidence)`
 
@@ -1567,7 +1688,7 @@ With a valid key and model, Claude returns a short Markdown answer (it will say 
 
 ---
 
-## Phase 6 — Generate the Incident Report
+## Phase 6 — Generate the Incident and RCA Report
 
 **Goal:** Save the evidence and Claude's analysis as a Markdown report.
 
@@ -1576,6 +1697,17 @@ With a valid key and model, Claude returns a short Markdown answer (it will say 
 - They give a **single record** of what was observed and when.
 - They can be shared with teammates, attached to tickets, and reviewed later.
 - They separate **facts** (raw Kubernetes output) from **interpretation** (Claude's analysis), so a reader can check the analysis against the evidence.
+
+### What is an RCA?
+
+A **Root Cause Analysis (RCA)** answers four questions about an incident:
+
+1. **What happened?** (problem statement, impact, timeline)
+2. **Why did it happen?** (root cause, contributing factors, five whys)
+3. **How do we fix it now?** (corrective actions)
+4. **How do we stop it happening again?** (preventive actions)
+
+A good RCA is based on evidence, not guesses. This project gets its evidence from Kubernetes (Phase 4), asks Claude to write the RCA from that evidence only (Phase 5), and saves both the evidence and the RCA in one Markdown file (this phase). The reader can check every RCA statement against the raw evidence in the same file.
 
 ### File: `agent/reporting.py`
 
@@ -1619,6 +1751,7 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
     metrics = evidence.get("metrics", {})
     events = evidence.get("events", {})
     logs = evidence.get("logs", {})
+    previous_logs = evidence.get("previous_logs", {})
     description = evidence.get("description", {})
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1631,7 +1764,7 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
         if metrics.get("error"):
             metrics_note += f"\n\nKubernetes said: `{metrics['error']}`"
 
-    content = f"""# Kubernetes Pod Incident Report
+    content = f"""# Kubernetes Pod Incident and Root Cause Analysis (RCA) Report
 
 - **Generated at (local time):** {datetime.now().isoformat(timespec="seconds")}
 - **Evidence collected at (UTC):** {evidence.get("collected_at_utc", "Unknown")}
@@ -1676,13 +1809,19 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
 {logs.get("logs", logs.get("error", "Unavailable"))}
 ```
 
+## Previous container logs (before the last restart)
+
+```text
+{previous_logs.get("logs", previous_logs.get("error", "Unavailable"))}
+```
+
 ## Pod description
 
 ```text
 {description.get("description", description.get("error", "Unavailable"))[:8000]}
 ```
 
-## AI investigation
+## Root cause analysis (AI-generated, advisory)
 
 {ai_explanation}
 
@@ -1756,140 +1895,188 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
 | Container state | `get_pod_status()["containers"]` | Fact |
 | Kubernetes events | `get_pod_events()` | Fact |
 | Recent logs | `get_pod_logs()` | Fact (or the `kubectl` error) |
+| Previous container logs | `get_pod_previous_logs()` | Fact (or the `kubectl` error) |
 | Pod description | `get_pod_description()` | Fact |
-| AI investigation (summary, confirmed observations, possible causes, next checks, confidence) | `explain_incident()` | **Interpretation** — advisory |
+| Root cause analysis (AI-generated, advisory): the twelve RCA sections | `explain_incident()` | **Interpretation** — advisory |
 | Verification and limitations | Fixed text | Statement of scope |
 
-**Confirmed observations vs possible causes:** Everything above the "AI investigation" heading is raw evidence. Inside the AI section, Claude is instructed to list **confirmed observations** (directly visible in the evidence) separately from **possible causes** (hypotheses, not yet confirmed). Always verify possible causes before acting.
+**Facts vs interpretation:** Everything above the "Root cause analysis" heading is raw evidence. Inside the RCA, Claude is instructed to list **confirmed observations** (directly visible in the evidence) separately, and to call a root cause "Confirmed" only when the evidence proves it. Otherwise it must say "Most likely root cause (not confirmed)". Always verify an unconfirmed root cause before acting.
 
-### Example report (broken Pod)
+### Example RCA report (crash-looping Pod)
 
-The excerpt below comes from a **real report generated by this project**: `reports/incident_ai-sre-lab_broken-image-demo_20261031_024857.md`. Long event and description lines are shortened with `[...]` here for readability.
+The excerpt below is a **real RCA report generated by this project** with a valid API key: `reports/incident_ai-sre-lab_crashloop-demo_20261031_041101.md`. The Pod comes from `k8s/crashloop-pod.yaml` (see [Step 8.9](#step-89--rca-of-a-crash-looping-pod)). The report is long, so it is shortened here: `[...]` marks removed text.
 
-In that run, no API key was configured, so the AI section contained the "unavailable" message. The **AI investigation shown after the excerpt is illustrative only**. It shows the structure Claude is asked to produce. It is not a recorded output.
+**Part 1 — Evidence collected by Python (facts):**
 
 ```markdown
-# Kubernetes Pod Incident Report
+# Kubernetes Pod Incident and Root Cause Analysis (RCA) Report
 
-- **Generated at (local time):** 2026-10-31T02:48:57
-- **Evidence collected at (UTC):** 2026-10-30T21:18:55.539251+00:00
-- **Pod name:** broken-image-demo
+- **Generated at (local time):** 2026-10-31T04:11:01
+- **Evidence collected at (UTC):** 2026-10-30T22:40:00.486190+00:00
+- **Pod name:** crashloop-demo
 - **Namespace:** ai-sre-lab
-- **Status:** Pending
+- **Status:** Running
 - **Node:** k3d-pod-lab-agent-0
-- **Pod IP:** 10.42.1.9
-- **Created:** 2026-10-30T21:18:29Z
+- **Pod IP:** 10.42.1.10
+- **Created:** 2026-10-30T22:38:27Z
 
 ## Actual CPU and RAM usage (live, from kubectl top)
 
     Unavailable
 
-**Live metrics could not be retrieved.** kubectl top failed. Metrics Server may not be installed, may not be ready, or the pod may not have metrics yet.
-
-Kubernetes said: `Error from server (NotFound): pods "broken-image-demo" not found`
-
-> CPU/RAM above is live usage from Kubernetes Metrics Server when available. It is not the pod's configured limit. If marked unavailable, no usage number was invented.
+**Live metrics could not be retrieved.** [...]
+Kubernetes said: `Error from server (NotFound): podmetrics.metrics.k8s.io "ai-sre-lab/crashloop-demo" not found`
 
 ## Configured CPU and RAM (requests and limits from the pod spec)
 
 | Container | CPU request | CPU limit | Memory request | Memory limit |
 |---|---|---|---|---|
-| web | Not set | Not set | Not set | Not set |
-
-> Requests and limits are configuration settings, not measurements.
+| app | 10m | 100m | 16Mi | 32Mi |
 
 ## Container state
 
     [
       {
-        "name": "web",
+        "name": "app",
         "ready": false,
-        "restart_count": 0,
-        "waiting_reason": "ImagePullBackOff",
+        "restart_count": 3,
+        "waiting_reason": "",
         "state": {
-          "waiting": {
-            "message": "Back-off pulling image \"httpd:tag-that-does-not-exist\": ErrImagePull: [...] not found",
-            "reason": "ImagePullBackOff"
-          }
+          "terminated": { [...] "exitCode": 1, "finishedAt": "2026-10-30T22:39:12Z", "reason": "Error", [...] }
+        },
+        "last_state": {
+          "terminated": { [...] "exitCode": 1, "finishedAt": "2026-10-30T22:38:49Z", "reason": "Error", [...] }
         }
       }
     ]
 
 ## Kubernetes events
 
-    LAST SEEN   TYPE      REASON      OBJECT                  [...]  MESSAGE
-    27s         Normal    Scheduled   pod/broken-image-demo   [...]  Successfully assigned ai-sre-lab/broken-image-demo to k3d-pod-lab-agent-0
-    22s         Normal    BackOff     pod/broken-image-demo   [...]  Back-off pulling image "httpd:tag-that-does-not-exist"
-    22s         Warning   Failed      pod/broken-image-demo   [...]  Error: ImagePullBackOff
-    11s         Normal    Pulling     pod/broken-image-demo   [...]  Pulling image "httpd:tag-that-does-not-exist"
-    9s          Warning   Failed      pod/broken-image-demo   [...]  Failed to pull image "httpd:tag-that-does-not-exist": rpc error: code = NotFound [...]
-    9s          Warning   Failed      pod/broken-image-demo   [...]  Error: ErrImagePull
+    FIRST_SEEN             LAST_SEEN              COUNT    TYPE      REASON      SOURCE    MESSAGE
+    <nil>                  <nil>                  <none>   Normal    Scheduled   <none>    Successfully assigned ai-sre-lab/crashloop-demo to k3d-pod-lab-agent-0
+    2026-10-30T22:38:31Z   2026-10-30T22:39:11Z   4        Normal    Pulled      kubelet   Container image "busybox:1.36" already present on machine [...]
+    2026-10-30T22:38:31Z   2026-10-30T22:39:11Z   4        Normal    Created     kubelet   Container created
+    2026-10-30T22:38:32Z   2026-10-30T22:39:12Z   4        Normal    Started     kubelet   Container started
+    2026-10-30T22:38:35Z   2026-10-30T22:39:14Z   4        Warning   BackOff     kubelet   Back-off restarting failed container app in pod crashloop-demo_ai-sre-lab(...)
 
 ## Recent logs
 
-    Error from server (BadRequest): container "web" in pod "broken-image-demo" is waiting to start: trying and failing to pull image
+    Starting payment-api v1.4.2
+    Loading configuration from /etc/app/config.yaml
+    ERROR: configuration file /etc/app/config.yaml not found
+
+## Previous container logs (before the last restart)
+
+    unable to retrieve container logs for containerd://d444ce82359c263fd4a9165bc1ed0774d51b816a164690950d8260d9e8dfa476
 
 ## Pod description
-
-    Name:             broken-image-demo
-    Namespace:        ai-sre-lab
-    [...]
-    Status:           Pending
-    IP:               10.42.1.9
-    [...]
-        Image:          httpd:tag-that-does-not-exist
-    [...]
-        State:          Waiting
-          Reason:       ImagePullBackOff
-        Ready:          False
-        Restart Count:  0
-    [...]
-    QoS Class:                   BestEffort
-
-## AI investigation
-
-AI explanation unavailable: set a valid ANTHROPIC_API_KEY in .env. The collected Kubernetes evidence is still included in the report.
-
-## Verification and limitations
-
-- This report is based on evidence collected from the current Kubernetes cluster.
-- The AI explanation is advisory; verify recommendations before making changes.
-- This program did not restart, delete, or modify the pod.
-- Missing metrics or unavailable logs are reported as unavailable, not guessed.
+[...]
 ```
 
 > In the real file, the evidence blocks use ```` ```text ```` and ```` ```json ```` fences. They are indented here only so the example displays correctly inside this README.
 
-Notice that the events are sorted by `lastTimestamp`, so a repeated event (such as `BackOff`) can appear above an earlier one. The `COUNT` column in the real report (removed here) shows how many times each event happened.
+Things to notice in the evidence:
 
-**Illustrative AI investigation section** (the structure Claude is asked to produce; the wording is an example, not recorded output):
+- **Status is `Running`** even though the container keeps crashing. For a restarting container, Kubernetes keeps the Pod phase `Running`. The real story is in **Container state**: `terminated`, `exitCode: 1`, `restart_count: 3`, and `last_state` showing the previous run also failed with exit code 1.
+- **Events have absolute times.** `COUNT 4` with `FIRST_SEEN` and `LAST_SEEN` shows four start/crash cycles in about 40 seconds.
+- **Current logs show the crash** because the container had just terminated. The previous-logs request failed for timing reasons (see `get_pod_previous_logs()` in Phase 4). The report shows that error honestly.
 
-```markdown
-## AI investigation
+**Part 2 — Root cause analysis written by Claude (interpretation), shortened:**
 
-### 1. Incident summary
-Pod `broken-image-demo` in namespace `ai-sre-lab` is not running. Its only container,
-`web`, is waiting because Kubernetes cannot pull the image `httpd:tag-that-does-not-exist`.
+````markdown
+## Root cause analysis (AI-generated, advisory)
 
-### 2. Confirmed observations
-- Pod phase is `Pending`; container `web` is not ready, restart count 0.
-- Container waiting reason is `ImagePullBackOff`.
-- Events show `Failed to pull image ... NotFound`, `ErrImagePull`, and `ImagePullBackOff`.
-- Logs are unavailable because the container never started.
-- Live CPU/RAM metrics are unavailable. No requests or limits are configured.
+### 1. Executive summary
+The `app` container in pod `crashloop-demo` exits with code 1 about as soon as it starts. Kubernetes has
+restarted it 3 times and is now applying restart back-off. The root cause is the container's configured
+command. It is a `sh -c` script that prints a "configuration file not found" message and then runs
+`exit 1` unconditionally. It never checks for the file. [...]
 
-### 3. Possible causes (not yet confirmed)
-- The tag `tag-that-does-not-exist` does not exist in the `httpd` repository (most likely; supported by the NotFound event).
-- Less likely: a typo in the image name, or a registry access problem.
+### 2. Problem statement
+- **Pod:** `crashloop-demo`
+- **Namespace:** `ai-sre-lab`
+- **Node:** `k3d-pod-lab-agent-0` (172.24.0.3)
+- **Symptom:** Container `app` repeatedly terminates with `reason: Error`, `exitCode: 1`. [...]
+- **First observed:** The first `BackOff` warning was at **2026-10-30T22:38:35Z**, about 8 seconds after pod creation (22:38:27Z).
 
-### 4. Recommended next checks (read-only first)
-- `kubectl get pod broken-image-demo -n ai-sre-lab -o jsonpath='{.spec.containers[*].image}'`
-- Check the available tags for `httpd` in the registry (for example, `2.4`).
-- After a human confirms the correct tag, update the manifest and re-apply it.
+### 3. Impact
+- **Container availability:** Container `app` has never reached Ready. [...]
+- **Service / user impact:** Unknown. The log text mentions "payment-api v1.4.2", but the evidence shows
+  no Service, no ports, no owner controller and no traffic data. [...]
+- **Resource usage:** Unknown. Metrics are unavailable [...]
 
-### 5. Confidence level
-High — the events state directly that the image reference was not found.
+### 4. Timeline (UTC)
+| Time (UTC) | Event | Source |
+|---|---|---|
+| Not recorded (`<nil>`) | `Scheduled`: pod assigned to `k3d-pod-lab-agent-0` | events |
+| 2026-10-30T22:38:27Z | Pod created / Start Time | pod.created, description |
+| 2026-10-30T22:38:32Z | First `Started` | events |
+| 2026-10-30T22:38:35Z | First `Warning BackOff`: restarting failed container `app` | events |
+| 2026-10-30T22:38:49Z | Previous run started and terminated: Error, exit code 1 | last_state |
+| 2026-10-30T22:39:12Z | Last `Started` (4th occurrence). Current run started and terminated: Error, exit code 1 | events, state |
+| 2026-10-30T22:40:00Z | Evidence collected: phase `Running`, container Terminated, restart count 3, Ready false | collected_at_utc |
+[...]
+
+### 6. Root cause
+**Confirmed root cause:** The container's configured command (`sh -c … exit 1`) terminates the process
+with exit code 1 on every run, regardless of conditions. [...]
+
+**Clarification on the log message:** The line "configuration file /etc/app/config.yaml not found" is
+printed by a hard-coded `echo`. It is not the result of an actual file check. [...] adding a config file
+or ConfigMap mount **would not fix this pod**, because `exit 1` executes unconditionally.
+
+### 7. Contributing factors
+- **Misleading error message:** The log points to a missing config file, which could send responders
+  toward a ConfigMap fix that would not resolve the crash.
+- **No controller:** Empty `owner_references` means there is no Deployment managing rollout or rollback. [...]
+- **Not a factor:** Memory and CPU limits. The termination reason is `Error`, not `OOMKilled` [...]
+
+### 8. Five whys
+1. **Why is the pod not Ready and in back-off?** Container `app` keeps terminating with exit code 1 [...]
+2. **Why does the container exit with code 1?** Its command is a shell script that ends with `exit 1`.
+3. **Why does the script exit 1?** The `exit 1` is unconditional. [...]
+4. **Why is the pod running this script instead of a working application?** Unknown. The evidence does not
+   show who authored the manifest or whether it was intentional [...]
+5. Stopping here; the evidence ends at the pod spec.
+
+### 9. Corrective actions
+[...]
+3. **Correct the manifest.** *Not performed by the agent; requires human approval.*
+   - Replace the `sh -c … exit 1` command with the real application image and entrypoint. [...]
+
+### 10. Preventive actions
+- **Use a controller:** Run workloads under a Deployment rather than as bare pods [...]
+- **Alerting and metrics:** Alert on `kube_pod_container_status_restarts_total` increases [...]
+
+### 11. Verification steps
+All commands below are read-only.
+```sh
+kubectl get pod crashloop-demo -n ai-sre-lab -o wide
+kubectl describe pod crashloop-demo -n ai-sre-lab
+kubectl logs crashloop-demo -n ai-sre-lab -c app
+[...]
 ```
+
+### 12. Confidence level and evidence gaps
+**Confidence: High** that the crash is caused by the container command's unconditional `exit 1`. The spec
+shows the command, the logs match its output exactly, and exit code 1 is recorded for both observed runs.
+
+**Confidence: Low** on intent, meaning whether this is a deliberate demo or a misdeployed `payment-api`,
+and on any business impact.
+
+**Evidence gaps:**
+- **Previous logs:** These were unavailable. The current logs plus the identical exit codes make it highly
+  likely they were the same, but this is not directly confirmed.
+[...]
+````
+
+What this shows about the RCA design:
+
+- **Facts vs interpretation:** Everything in Part 1 is raw Kubernetes output. Part 2 is Claude's analysis, and it cites where each fact came from (`events`, `last_state`, `collected_at_utc`).
+- **Confirmed only when proven:** It labelled the root cause "Confirmed" because the spec, logs, and exit codes all prove it, and kept intent and business impact as "unknown" or "Low".
+- **Thinks beyond the obvious:** It noticed that the "config file not found" message is a hard-coded `echo`, so a ConfigMap fix alone would not work. A quick reading of the logs would have missed this.
+- **No invented numbers:** CPU/RAM are reported as unavailable, and the missing `Scheduled` timestamp is written as "Not recorded".
+- **Read-only:** Every corrective action is marked "not performed by the agent; requires human approval". The agent changed nothing.
 
 ---
 
@@ -1944,7 +2131,7 @@ def choose_pod(namespace):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Investigate a Kubernetes pod and create a Markdown report."
+        description="Investigate a Kubernetes pod and create a Markdown RCA report."
     )
     parser.add_argument("--pod", help="Exact pod name (leave out to choose from a list)")
     parser.add_argument("--namespace", default="ai-sre-lab", help="Kubernetes namespace")
@@ -1978,7 +2165,7 @@ def main():
     print("\n[4/5] Reading CPU/RAM with LangChain tool...")
     print(read_pod_cpu_ram.invoke({"pod_name": pod_name, "namespace": namespace}))
 
-    print("\n[5/5] Collecting full evidence and asking Claude for an explanation...")
+    print("\n[5/5] Collecting full evidence and asking Claude for a root cause analysis...")
     evidence = collect_pod_evidence(pod_name, namespace)
     explanation = explain_incident(evidence)
     report_path = create_markdown_report(
@@ -2026,8 +2213,8 @@ if __name__ == "__main__":
 2. **It receives the target Pod and namespace.** `argparse` reads `--pod` (optional) and `--namespace` (default `ai-sre-lab`). The namespace is validated first. Then the Pod name comes from `--pod` or from `choose_pod()`, and is validated. Invalid names print an error and exit with code 1.
 3. **Python checks that the Pod exists — `[1/5]`.** `inspect_pod.invoke(...)` runs `get_pod_status()`. If `ok` is false (for example `pods "ghost" not found`), the program prints the error and a hint, then exits with code 1. **No report is created and Claude is not called.** On success, the status is printed as JSON.
 4. **Python shows the other diagnostics — `[2/5]` to `[4/5]`.** It invokes `read_pod_logs`, `read_pod_events`, and `read_pod_cpu_ram`, and prints each result dictionary. These steps are for **on-screen visibility**. A failure here (for example, no logs) does **not** stop the program.
-5. **The diagnostic results are prepared — `[5/5]`.** `collect_pod_evidence()` gathers status, metrics, events, logs, and description into one dictionary with a UTC timestamp.
-6. **Claude analyses the collected information.** `explain_incident(evidence)` returns Claude's Markdown analysis, or an "AI explanation unavailable" message.
+5. **The diagnostic results are prepared — `[5/5]`.** `collect_pod_evidence()` gathers status, metrics, events, current logs, previous logs, and description into one dictionary with a UTC timestamp.
+6. **Claude writes the Root Cause Analysis.** `explain_incident(evidence)` returns Claude's twelve-section Markdown RCA, or an "AI explanation unavailable" message.
 7. **The report generator creates the incident report.** `create_markdown_report(...)` builds the Markdown.
 8. **The report is saved inside `reports/`.** The path is printed, along with a `cat` command to open it.
 
@@ -2043,7 +2230,7 @@ main.py
  ├─ read_pod_logs.invoke() ─────▶ agent_tools ─▶ pod_tools.get_pod_logs()   ─▶ kubectl logs
  ├─ read_pod_events.invoke() ───▶ agent_tools ─▶ pod_tools.get_pod_events() ─▶ kubectl get events
  ├─ read_pod_cpu_ram.invoke() ──▶ agent_tools ─▶ pod_tools.get_pod_metrics()─▶ kubectl top pod
- ├─ collect_pod_evidence() ─────▶ pod_tools (all five collectors + describe)
+ ├─ collect_pod_evidence() ─────▶ pod_tools (all six collectors, including previous logs + describe)
  ├─ explain_incident(evidence) ─▶ claude_client ─▶ Claude API
  └─ create_markdown_report(...) ▶ reporting ─▶ reports/incident_*.md
 ```
@@ -2270,6 +2457,67 @@ def test_missing_api_key_gives_clear_message(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "replace_with_your_real_key")
     message = claude_client.explain_incident({"pod": {}})
     assert "AI explanation unavailable" in message
+
+
+# ---------- RCA tests ----------
+
+def test_last_state_is_recorded_for_restarted_container(monkeypatch):
+    pod = json.loads(fake_pod_json("crashloop-demo", "Running", ready=False,
+                                   waiting_reason="CrashLoopBackOff"))
+    pod["status"]["containerStatuses"][0]["restartCount"] = 4
+    pod["status"]["containerStatuses"][0]["lastState"] = {
+        "terminated": {"exitCode": 1, "reason": "Error"}
+    }
+    monkeypatch.setattr(
+        pod_tools, "run_kubectl",
+        lambda args, timeout=20: {"ok": True, "output": json.dumps(pod)}
+    )
+    status = get_pod_status("crashloop-demo", "ai-sre-lab")
+    container = status["containers"][0]
+    assert container["waiting_reason"] == "CrashLoopBackOff"
+    assert container["restart_count"] == 4
+    assert container["last_state"]["terminated"]["exitCode"] == 1
+
+
+def test_previous_logs_error_is_reported(monkeypatch):
+    calls = []
+
+    def fake_run(args, timeout=20):
+        calls.append(args)
+        return {"ok": False, "error": 'previous terminated container "web" not found'}
+
+    monkeypatch.setattr(pod_tools, "run_kubectl", fake_run)
+    result = pod_tools.get_pod_previous_logs("demo-web-abc", "ai-sre-lab")
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+    assert "--previous" in calls[0]
+
+
+def test_prompt_asks_for_rca_sections():
+    prompt = claude_client.build_prompt({"pod": {"phase": "Pending"}})
+    for section in ["Executive summary", "Timeline (UTC)", "Root cause",
+                    "Five whys", "Corrective actions", "Preventive actions",
+                    "Confidence level and evidence gaps"]:
+        assert section in prompt
+    assert '"phase": "Pending"' in prompt
+
+
+def test_report_contains_rca_and_previous_logs(tmp_path, monkeypatch):
+    monkeypatch.setenv("REPORT_DIR", str(tmp_path))
+    evidence = {
+        "pod": {"phase": "Running"},
+        "metrics": {"ok": True, "cpu_ram": "web 1m 2Mi"},
+        "previous_logs": {"ok": True, "logs": "ERROR: config file not found"},
+    }
+    path = create_markdown_report(
+        "crashloop-demo", "ai-sre-lab", evidence, "### 6. Root cause\nBad config."
+    )
+    content = open(path, encoding="utf-8").read()
+    assert "Root Cause Analysis (RCA) Report" in content
+    assert "## Previous container logs" in content
+    assert "ERROR: config file not found" in content
+    assert "## Root cause analysis (AI-generated, advisory)" in content
+    assert "Bad config." in content
 ```
 
 **Testing techniques used:**
@@ -2293,6 +2541,10 @@ def test_missing_api_key_gives_clear_message(monkeypatch):
 | 8–11 | `test_invalid_names_are_rejected` (4 cases) | `""`, `"Bad_Name"`, `"pod;rm -rf"`, and `"-starts-with-dash"` are all rejected with `ValueError`. |
 | 12 | `test_report_separates_usage_from_configured_limits` | The report has separate "Actual" and "Configured" sections, and the limits table row is correct. |
 | 13 | `test_missing_api_key_gives_clear_message` | With the placeholder key, `explain_incident` returns "AI explanation unavailable" and makes no API call. |
+| 14 | `test_last_state_is_recorded_for_restarted_container` | For a crash-looping Pod, `get_pod_status` records `waiting_reason: CrashLoopBackOff`, the restart count, and `last_state` with the previous exit code. |
+| 15 | `test_previous_logs_error_is_reported` | `get_pod_previous_logs` really uses `--previous`, and returns `ok: False` with the real error when there is no previous container. |
+| 16 | `test_prompt_asks_for_rca_sections` | The prompt asks for the RCA sections (executive summary, timeline, root cause, five whys, corrective and preventive actions, confidence and evidence gaps) and contains the evidence. |
+| 17 | `test_report_contains_rca_and_previous_logs` | The report has the RCA title, the "Previous container logs" section with its content, and the "Root cause analysis (AI-generated, advisory)" section. |
 
 #### Run the tests
 
@@ -2319,23 +2571,27 @@ pytest -v tests/test_pod_tools.py::test_broken_pod_status_shows_waiting_reason
 **Expected result.** This output was recorded on this project (the timing will differ on your machine):
 
 ```text
-collected 13 items
+collected 17 items
 
-tests/test_pod_tools.py::test_metrics_error_is_reported PASSED           [  7%]
-tests/test_pod_tools.py::test_report_contains_pod_identity_and_metrics PASSED [ 15%]
-tests/test_pod_tools.py::test_report_marks_missing_metrics PASSED        [ 23%]
-tests/test_pod_tools.py::test_healthy_pod_status_is_parsed PASSED        [ 30%]
-tests/test_pod_tools.py::test_broken_pod_status_shows_waiting_reason PASSED [ 38%]
-tests/test_pod_tools.py::test_missing_pod_returns_error PASSED           [ 46%]
-tests/test_pod_tools.py::test_missing_pod_does_not_create_report PASSED  [ 53%]
-tests/test_pod_tools.py::test_invalid_names_are_rejected[] PASSED        [ 61%]
-tests/test_pod_tools.py::test_invalid_names_are_rejected[Bad_Name] PASSED [ 69%]
-tests/test_pod_tools.py::test_invalid_names_are_rejected[pod;rm -rf] PASSED [ 76%]
-tests/test_pod_tools.py::test_invalid_names_are_rejected[-starts-with-dash] PASSED [ 84%]
-tests/test_pod_tools.py::test_report_separates_usage_from_configured_limits PASSED [ 92%]
-tests/test_pod_tools.py::test_missing_api_key_gives_clear_message PASSED [100%]
+tests/test_pod_tools.py::test_metrics_error_is_reported PASSED           [  5%]
+tests/test_pod_tools.py::test_report_contains_pod_identity_and_metrics PASSED [ 11%]
+tests/test_pod_tools.py::test_report_marks_missing_metrics PASSED        [ 17%]
+tests/test_pod_tools.py::test_healthy_pod_status_is_parsed PASSED        [ 23%]
+tests/test_pod_tools.py::test_broken_pod_status_shows_waiting_reason PASSED [ 29%]
+tests/test_pod_tools.py::test_missing_pod_returns_error PASSED           [ 35%]
+tests/test_pod_tools.py::test_missing_pod_does_not_create_report PASSED  [ 41%]
+tests/test_pod_tools.py::test_invalid_names_are_rejected[] PASSED        [ 47%]
+tests/test_pod_tools.py::test_invalid_names_are_rejected[Bad_Name] PASSED [ 52%]
+tests/test_pod_tools.py::test_invalid_names_are_rejected[pod;rm -rf] PASSED [ 58%]
+tests/test_pod_tools.py::test_invalid_names_are_rejected[-starts-with-dash] PASSED [ 64%]
+tests/test_pod_tools.py::test_report_separates_usage_from_configured_limits PASSED [ 70%]
+tests/test_pod_tools.py::test_missing_api_key_gives_clear_message PASSED [ 76%]
+tests/test_pod_tools.py::test_last_state_is_recorded_for_restarted_container PASSED [ 82%]
+tests/test_pod_tools.py::test_previous_logs_error_is_reported PASSED     [ 88%]
+tests/test_pod_tools.py::test_prompt_asks_for_rca_sections PASSED        [ 94%]
+tests/test_pod_tools.py::test_report_contains_rca_and_previous_logs PASSED [100%]
 
-============================== 13 passed in 5.74s ==============================
+============================== 17 passed in 4.72s ==============================
 ```
 
 ### Part B — Real investigation on the cluster
@@ -2439,16 +2695,16 @@ Investigating pod demo-web-665f97df4c-mj54n in namespace ai-sre-lab (read-only).
 [4/5] Reading CPU/RAM with LangChain tool...
 {'ok': True, 'cpu_ram': 'POD                         NAME    CPU(cores)   MEMORY(bytes)   \ndemo-web-665f97df4c-mj54n   httpd   1m           6Mi'}
 
-[5/5] Collecting full evidence and asking Claude for an explanation...
+[5/5] Collecting full evidence and asking Claude for a root cause analysis...
 
 Report created successfully:
-reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_024819.md
+reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_041322.md
 
 Open it with:
-cat reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_024819.md
+cat reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_041322.md
 ```
 
-The `owner_references` show that the Pod is controlled by the ReplicaSet `demo-web-665f97df4c`, which belongs to the `demo-web` Deployment. With a real API key, step 5 takes a few seconds longer because it waits for Claude's response.
+The `owner_references` show that the Pod is controlled by the ReplicaSet `demo-web-665f97df4c`, which belongs to the `demo-web` Deployment. With a real API key, step 5 takes longer (up to a minute or more) because it waits for Claude's full response.
 
 #### Step 8.4 — Verify the healthy report
 
@@ -2457,7 +2713,7 @@ ls -lh ~/agent/reports
 cat ~/agent/reports/incident_ai-sre-lab_<POD_NAME>_<TIMESTAMP>.md
 ```
 
-Use the exact path printed by the program. Key parts of the recorded healthy report (`reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_024819.md`; event columns shortened):
+Use the exact path printed by the program. Key parts of the recorded healthy reports. The events are from the RCA run about an hour after the Pod started (`reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_041322.md`); the start-up events had already expired by then, which is normal:
 
 ```text
 - **Pod name:** demo-web-665f97df4c-mj54n
@@ -2474,12 +2730,9 @@ demo-web-665f97df4c-mj54n   httpd   1m           6Mi
 | httpd | 50m | 250m | 64Mi | 128Mi |
 
 ## Kubernetes events
-LAST SEEN   TYPE     REASON      [...]  MESSAGE
-2m23s       Normal   Scheduled   [...]  Successfully assigned ai-sre-lab/demo-web-665f97df4c-mj54n to k3d-pod-lab-agent-0
-2m14s       Normal   Pulling     [...]  Pulling image "httpd:2.4"
-76s         Normal   Pulled      [...]  Successfully pulled image "httpd:2.4" in 57.806s (57.806s including waiting). [...]
-75s         Normal   Created     [...]  Container created
-75s         Normal   Started     [...]  Container started
+FIRST_SEEN             LAST_SEEN              COUNT   TYPE      REASON                 SOURCE                      MESSAGE
+2026-10-30T21:58:45Z   2026-10-30T21:58:45Z   1       Warning   NodeNotReady           node-controller             Node is not ready
+2026-10-30T21:58:56Z   2026-10-30T21:58:56Z   1       Normal    TaintManagerEviction   taint-eviction-controller   Cancelling deletion of Pod ai-sre-lab/demo-web-665f97df4c-mj54n
 
 ## Recent logs
 AH00558: httpd: Could not reliably determine the server's fully qualified domain name, using 10.42.1.4. Set the 'ServerName' directive globally to suppress this message
@@ -2488,7 +2741,12 @@ AH00558: httpd: Could not reliably determine the server's fully qualified domain
 [Fri Oct 30 21:17:05.070251 2026] [core:notice] [pid 1:tid 1] AH00094: Command line: 'httpd -D FOREGROUND'
 127.0.0.1 - - [30/Oct/2026:21:17:24 +0000] "GET / HTTP/1.1" 200 191
 10.42.1.5 - - [30/Oct/2026:21:17:39 +0000] "GET / HTTP/1.1" 200 191
+
+## Previous container logs (before the last restart)
+Error from server (BadRequest): previous terminated container "httpd" in pod "demo-web-665f97df4c-mj54n" not found
 ```
+
+The previous-logs error is expected: the `httpd` container has never restarted, so there is no previous run.
 
 **How to read the HTTPD logs:**
 
@@ -2499,7 +2757,7 @@ AH00558: httpd: Could not reliably determine the server's fully qualified domain
 | `AH00094: Command line: 'httpd -D FOREGROUND'` | HTTPD runs in the foreground, as a container's main process must. | No |
 | `"GET / HTTP/1.1" 200 191` | Access log: a request for `/` returned HTTP 200 with 191 bytes. These come from the `curl` and BusyBox checks in Step 2.7. | No |
 
-This is a good example of why the prompt asks Claude to separate **confirmed observations** from **possible causes**: a log line can look like a warning without indicating an incident.
+This is a good example of why the RCA prompt asks Claude to separate **confirmed observations** from conclusions: a log line can look like a warning without indicating an incident.
 
 Check that:
 
@@ -2507,9 +2765,18 @@ Check that:
 - [ ] Status is `Running` and the `httpd` container is `ready: true` with `restart_count: 0`.
 - [ ] Live usage shows real numbers (or "Unavailable" with a reason).
 - [ ] Configured requests and limits match `k8s/demo.yaml` (`50m`/`250m`, `64Mi`/`128Mi`).
-- [ ] Events show `Scheduled`, `Pulling`, `Pulled`, `Created`, `Started` (if they have not expired yet).
+- [ ] Events show `Scheduled`, `Pulling`, `Pulled`, `Created`, `Started` with absolute UTC times (if they have not expired yet; Kubernetes keeps events for about one hour).
 - [ ] Logs show HTTPD start-up lines (and access log lines if you sent requests).
-- [ ] The AI investigation is present, or it clearly says why AI was unavailable.
+- [ ] The "Root cause analysis" section is present (for a healthy Pod it should say **No incident detected**), or it clearly says why AI was unavailable.
+
+**What Claude's RCA said in the recorded healthy report** (`reports/incident_ai-sre-lab_demo-web-665f97df4c-mj54n_20261031_041322.md`):
+
+- **Root cause: "No incident detected" for this pod.** The Pod never failed, restarted, or was evicted, and it served HTTP 200 responses before and after the node event. Claude did **not** invent a root cause.
+- **A real event on the timeline:** node `k3d-pod-lab-agent-0` was reported `NotReady` at **21:58:45Z**, and the pending eviction of this Pod was cancelled 11 seconds later at **21:58:56Z**. The absolute event timestamps made this precise timeline possible.
+- **Honest confidence:** **High** that the Pod is healthy. **Low** on why the node became NotReady, because no node-level evidence was collected. Claude listed node conditions and k3s agent logs as the evidence that would raise confidence.
+- **`AH00558` is cosmetic**, normal for a default httpd image.
+
+This is a good example of the agent's value. A "healthy" Pod still had a short node problem in its history. The agent surfaced it with honest confidence levels, and changed nothing.
 
 #### Step 8.5 — Deploy the deliberately broken Pod
 
@@ -2600,13 +2867,13 @@ Recorded output from step 2 onward (step 1 printed the Pod status JSON; long lin
 [4/5] Reading CPU/RAM with LangChain tool...
 {'ok': False, 'cpu_ram': 'Unavailable', 'note': 'kubectl top failed. Metrics Server may not be installed, may not be ready, or the pod may not have metrics yet.', 'error': 'Error from server (NotFound): pods "broken-image-demo" not found'}
 
-[5/5] Collecting full evidence and asking Claude for an explanation...
+[5/5] Collecting full evidence and asking Claude for a root cause analysis...
 
 Report created successfully:
-reports/incident_ai-sre-lab_broken-image-demo_20261031_024857.md
+reports/incident_ai-sre-lab_broken-image-demo_20261031_041222.md
 
 Open it with:
-cat reports/incident_ai-sre-lab_broken-image-demo_20261031_024857.md
+cat reports/incident_ai-sre-lab_broken-image-demo_20261031_041222.md
 ```
 
 Step `[1/5]` succeeds because the Pod object exists. Steps `[2/5]` and `[4/5]` return `ok: False`. This is expected: the program continues and records these failures as evidence.
@@ -2621,27 +2888,156 @@ Open the report path printed by the program. Check that:
 - [ ] The configured table shows `Not set` for every value.
 - [ ] Events show `Failed to pull image "httpd:tag-that-does-not-exist" ... NotFound`, `ErrImagePull`, and `ImagePullBackOff`.
 - [ ] Recent logs show the "waiting to start" error, not application logs.
-- [ ] If the AI is configured, its **confirmed observations** mention the pull failure, and its **possible causes** point to the invalid image tag.
+- [ ] If the AI is configured, the RCA says **Confirmed root cause:** the image tag `httpd:tag-that-does-not-exist` does not exist, with **High** confidence.
+- [ ] The previous-logs section shows an error: the container never started, so there is no previous run.
 
-The full report is shown in the [example report](#example-report-broken-pod) in Phase 6.
+Key lines from the recorded RCA (`reports/incident_ai-sre-lab_broken-image-demo_20261031_041222.md`), shortened:
 
-#### Step 8.9 — Compare the healthy and broken reports
+```markdown
+### 1. Executive summary
+The `web` container in pod `ai-sre-lab/broken-image-demo` has never started because the kubelet cannot pull
+the image `httpd:tag-that-does-not-exist`. The registry returned `NotFound` for
+`docker.io/library/httpd:tag-that-does-not-exist`, so the image reference points to a tag that does not exist. [...]
 
-All values below are from the two recorded reports.
+### 6. Root cause
+**Confirmed root cause:** The pod spec references the image tag `httpd:tag-that-does-not-exist`. That tag does
+not exist in `docker.io/library/httpd`.
+- The container runtime's pull failed with `code = NotFound ... failed to resolve reference ... not found`.
+- The kubelet therefore entered exponential back-off (`ImagePullBackOff`).
+- The container has never been created as a result.
 
-| Check | Healthy Pod (`demo-web-665f97df4c-mj54n`) | Broken Pod (`broken-image-demo`) |
-|---|---|---|
-| Status (phase) | `Running` | `Pending` |
-| Container | `httpd`, ready `true`, restarts 0 | `web`, ready `false`, restarts 0 |
-| Waiting reason | empty | `ImagePullBackOff` |
-| Live CPU/RAM | `1m` CPU, `6Mi` memory | `Unavailable` + `NotFound` error from Metrics |
-| Configured requests/limits | `50m`/`250m` CPU, `64Mi`/`128Mi` memory | `Not set` |
-| QoS class (from describe) | `Burstable` | `BestEffort` |
-| Events | Scheduled → Pulling → Pulled → Created → Started | Scheduled → Pulling → Failed (NotFound) → ErrImagePull → BackOff → ImagePullBackOff |
-| Logs | HTTPD start-up and access log lines | `kubectl logs` error: waiting to start |
-| Expected AI conclusion | No problem observed; `AH00558` is informational | Image pull failure, most likely an invalid tag |
+### 12. Confidence level and evidence gaps
+**Confidence: High** for the root cause. The container status contains the runtime's explicit `NotFound` error
+for the exact image reference. [...]
+```
 
-#### Step 8.10 — Test error handling (missing Pod and invalid name)
+A complete RCA example (crash-looping Pod) is shown in [Example RCA report](#example-rca-report-crash-looping-pod) in Phase 6.
+
+#### Step 8.9 — RCA of a crash-looping Pod
+
+`ImagePullBackOff` is a failure where the container never starts. The second common failure is **`CrashLoopBackOff`**: the container starts, crashes, and Kubernetes keeps restarting it. This test shows how the RCA uses the **previous container state** (`last_state`) and the crash logs.
+
+**File: `agent/k8s/crashloop-pod.yaml`**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashloop-demo
+  namespace: ai-sre-lab
+  labels:
+    app: crashloop-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "Starting payment-api v1.4.2"
+          echo "Loading configuration from /etc/app/config.yaml"
+          echo "ERROR: configuration file /etc/app/config.yaml not found" >&2
+          exit 1
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "100m"
+          memory: "32Mi"
+```
+
+**Explanation:**
+
+- `image: busybox:1.36` — a tiny image with a shell. It simulates an application.
+- `command:` — a shell script that prints start-up lines, prints a config error to stderr, and exits with code `1` (failure).
+- A bare Pod uses `restartPolicy: Always` by default, so Kubernetes restarts the container after every exit, with an increasing delay. This produces `CrashLoopBackOff`.
+- The script **always** exits 1. It does not actually check for the file. This is deliberate: it tests whether the RCA reads the evidence carefully instead of trusting the error message.
+- `resources` are set, so the report shows a configured table and the Pod is `Burstable`.
+
+**Deploy it and watch it crash:**
+
+```bash
+kubectl apply -f ~/agent/k8s/crashloop-pod.yaml
+kubectl get pod crashloop-demo -n ai-sre-lab -w
+```
+
+Wait until `RESTARTS` is 3 or more (about one minute), then press `Ctrl+C`. The `STATUS` column changes between `Error`, `CrashLoopBackOff`, and (briefly) `Running`.
+
+Recorded output:
+
+```text
+NAME             READY   STATUS   RESTARTS      AGE
+crashloop-demo   0/1     Error    3 (30s ago)   52s
+```
+
+**Check the crash logs by hand:**
+
+```bash
+kubectl logs crashloop-demo -n ai-sre-lab
+kubectl logs crashloop-demo -n ai-sre-lab --previous
+```
+
+Recorded output:
+
+```text
+Starting payment-api v1.4.2
+Loading configuration from /etc/app/config.yaml
+ERROR: configuration file /etc/app/config.yaml not found
+
+unable to retrieve container logs for containerd://d444ce82359c263fd4a9165bc1ed0774d51b816a164690950d8260d9e8dfa476
+```
+
+The `--previous` error is a timing effect: while the crashed container waits for its next restart, the regular logs already show the last crash, and the older run may already be removed. Try again a few seconds later and you may get the previous logs. The agent collects both, so either way the crash output is in the report.
+
+**Run the RCA:**
+
+```bash
+cd ~/agent
+source .venv/bin/activate
+python main.py --pod crashloop-demo --namespace ai-sre-lab
+```
+
+Recorded output (step lines only):
+
+```text
+[1/5] Checking pod status with LangChain tool...
+[2/5] Reading logs with LangChain tool...
+[3/5] Reading events with LangChain tool...
+[4/5] Reading CPU/RAM with LangChain tool...
+[5/5] Collecting full evidence and asking Claude for a root cause analysis...
+reports/incident_ai-sre-lab_crashloop-demo_20261031_041101.md
+```
+
+**Verify the crash-loop RCA report.** Check that:
+
+- [ ] **Status** is `Running`. This is correct Kubernetes behaviour for a restarting container; the real problem is in Container state.
+- [ ] **Container state** shows `restart_count` of 3 or more, `terminated` with `exitCode: 1`, and `last_state` with another `exitCode: 1`.
+- [ ] **Events** show `Started` and `BackOff` with `COUNT` greater than 1 and absolute times.
+- [ ] **Recent logs** (or **Previous container logs**) show `ERROR: configuration file /etc/app/config.yaml not found`.
+- [ ] The **RCA** identifies the unconditional `exit 1` in the container command as the **confirmed root cause**, rules out `OOMKilled` (reason is `Error`), and marks all fixes as requiring human approval.
+
+The recorded report is shown in full (shortened) in [Example RCA report](#example-rca-report-crash-looping-pod) in Phase 6. In that run, Claude also noticed that the "config file not found" message is a hard-coded `echo`, so mounting a config file alone would not fix the Pod.
+
+#### Step 8.10 — Compare the three RCA reports
+
+All values below are from the recorded RCA reports.
+
+| Check | Healthy (`demo-web-...`) | Broken image (`broken-image-demo`) | Crash loop (`crashloop-demo`) |
+|---|---|---|---|
+| Status (phase) | `Running` | `Pending` | `Running` (restarting) |
+| Container | `httpd`, ready `true`, restarts 0 | `web`, ready `false`, restarts 0 | `app`, ready `false`, restarts 3 |
+| Current state | `running` | `waiting`: `ImagePullBackOff` | `terminated`: `Error`, exit code 1 |
+| `last_state` | empty | empty | `terminated`: `Error`, exit code 1 |
+| Live CPU/RAM | `1m` CPU, `6Mi` memory | `Unavailable` | `Unavailable` |
+| Configured requests/limits | `50m`/`250m`, `64Mi`/`128Mi` | `Not set` | `10m`/`100m`, `16Mi`/`32Mi` |
+| Logs | HTTPD start-up + access lines | "waiting to start" error | the crash output with the config error |
+| Previous logs | none (never restarted) | none (never started) | timing error in the recorded run |
+| **RCA root cause** | **No incident detected** | **Confirmed:** image tag does not exist | **Confirmed:** command always runs `exit 1` |
+| **RCA confidence** | High (Pod healthy); Low (node blip cause) | High | High (cause); Low (intent, impact) |
+
+#### Step 8.11 — Test error handling (missing Pod and invalid name)
 
 ```bash
 python main.py --pod pod-that-does-not-exist --namespace ai-sre-lab
@@ -2665,15 +3061,16 @@ Names may only use lowercase letters, numbers, '-' and '.'.
 
 In both cases, the program exits with code 1 and **no report is created**. In the recorded run, `ls reports/` showed no new file after these commands.
 
-#### Step 8.11 — Clean up the broken Pod
+#### Step 8.12 — Clean up the test Pods
 
 This is a manual step by you. The agent never deletes anything.
 
 ```bash
 kubectl delete pod broken-image-demo -n ai-sre-lab
+kubectl delete pod crashloop-demo -n ai-sre-lab
 ```
 
-This removes only the deliberately broken test Pod. The healthy Deployment keeps running.
+This removes only the two deliberately broken test Pods. The healthy Deployment keeps running.
 
 To delete the whole lab cluster when you are finished:
 
@@ -2748,15 +3145,15 @@ Each issue lists: what it means, how to identify it, how to fix it, and how to v
 ### 6. CrashLoopBackOff
 
 - **Meaning:** The container starts and then exits again and again. Kubernetes waits longer between each restart.
-- **Identify:** Status `CrashLoopBackOff`. `restart_count` increases. The report shows `waiting_reason: "CrashLoopBackOff"`.
-- **Fix:** Read the logs of the **previous** run. The agent reads only the current run's logs, so run this manually:
+- **Identify:** Status `CrashLoopBackOff` (or `Error` between restarts). `restart_count` increases. In the report, Container state shows `waiting_reason: "CrashLoopBackOff"` or a `terminated` state, and `last_state` shows the previous exit code and reason.
+- **Troubleshoot:** Run the agent; its RCA uses `last_state`, current logs, and previous logs. To check by hand:
 
   ```bash
   kubectl logs <pod> -n ai-sre-lab --previous
   kubectl describe pod <pod> -n ai-sre-lab | grep -A5 "Last State"
   ```
 
-  A `Last State` reason of `OOMKilled` means the container hit its memory limit.
+  A `Last State` reason of `OOMKilled` means the container hit its memory limit. A reason of `Error` with a non-zero exit code means the application itself exited with a failure. If `--previous` says `unable to retrieve container logs`, wait a few seconds and try again; the regular `kubectl logs` usually shows the last crash in the meantime. See [Step 8.9](#step-89--rca-of-a-crash-looping-pod) for a full example.
 - **Verify:** After the fix, the Pod stays `Running` and the restart count stops increasing.
 
 ### 7. Missing Kubernetes metrics
@@ -2833,7 +3230,7 @@ Each issue lists: what it means, how to identify it, how to fix it, and how to v
   | `API error <code>: <message>` | Another API error (e.g. 400, 500, 529 overloaded) | Read the message; for 5xx/529, retry later |
   | `Claude declined this request.` | The model refused | Check the evidence content; retry |
 
-- **Verify:** A new report contains the five-section AI analysis.
+- **Verify:** A new report contains the twelve-section RCA.
 
 ### 12. Report generation failures
 
@@ -2855,7 +3252,7 @@ Each issue lists: what it means, how to identify it, how to fix it, and how to v
   - Activate the venv.
   - Read the first traceback line that points to a project file. If you changed messages in the code (for example, "Live metrics could not be retrieved"), the tests that check that text will fail.
   - Run one test with more detail: `pytest -v tests/test_pod_tools.py::<test_name>`.
-- **Verify:** `pytest -q` reports `13 passed`.
+- **Verify:** `pytest -q` reports `17 passed`.
 
 ---
 
@@ -2896,7 +3293,8 @@ Reports contain logs, Pod IPs, node names, and `describe` output. They are ignor
 - Read events for the Pod.
 - Read live CPU/RAM usage when Metrics Server provides it.
 - Read configured CPU/memory requests and limits.
-- Ask Claude for a structured analysis that separates confirmed observations from possible causes.
+- Ask Claude for a structured Root Cause Analysis: timeline, confirmed observations, root cause (confirmed or not), five whys, corrective and preventive actions, and confidence level.
+- Say "No incident detected" for a healthy Pod instead of inventing a root cause.
 - Save a timestamped Markdown report, even when the AI is unavailable.
 - Reject unsafe or invalid names, and refuse to create a report for a Pod that does not exist.
 
@@ -2904,7 +3302,6 @@ Reports contain logs, Pod IPs, node names, and `describe` output. They are ignor
 
 - It does **not** restart, delete, scale, patch, roll back, or repair anything. It is **not** a self-healing system.
 - It does **not** let Claude choose or run tools. The tool order is fixed in `main.py`.
-- It does **not** read logs from a previous crashed container (`--previous`).
 - It does **not** investigate a whole Deployment, Service, node, or namespace at once. It investigates one Pod at a time.
 - It does **not** monitor continuously or send alerts. It runs once when you start it.
 - It does **not** estimate CPU/RAM when metrics are unavailable.
@@ -2947,10 +3344,13 @@ The project files have evolved beyond the code printed in `manual.docs`. This RE
 | Area | `manual.docs` | Current project files |
 |---|---|---|
 | `pod_tools.py` | No `list_pods()` or `get_configured_resources()`; no `waiting_reason`; unused `from pathlib import Path`; no handling for invalid JSON | All of these are added; invalid JSON returns a clear error |
-| `claude_client.py` | Single prompt inside `explain_incident()`; evidence cut at 18,000 characters; `max_tokens=900`; one catch-all `except Exception` | Separate `build_prompt()`; full evidence; `max_tokens=8000`; specific API error handling; refusal check; five required output sections |
+| `claude_client.py` | Single prompt inside `explain_incident()`; evidence cut at 18,000 characters; `max_tokens=900`; one catch-all `except Exception` | Separate `build_prompt()`; full evidence; `max_tokens=8000`; specific API error handling; refusal check; twelve-section RCA prompt |
 | `reporting.py` | One combined CPU/RAM section | Separate "Actual usage" and "Configured requests/limits" sections; UTC collection time; clearer missing-metrics note |
 | `main.py` | `--pod` is required | `--pod` is optional; `choose_pod()` lists Pods; friendly error on invalid names |
-| Tests | 3 tests, NGINX sample data | 13 test cases (10 test functions, one parametrised ×4), HTTPD sample data |
+| Tests | 3 tests, NGINX sample data | 17 test cases (14 test functions, one parametrised ×4), HTTPD sample data, RCA tests |
+| AI output | General explanation | Structured 12-section Root Cause Analysis |
+| Evidence | Current logs, events with relative ages | Adds previous container state (`last_state`), previous container logs, and events with absolute UTC timestamps |
+| Crash test Pod | Not included | `k8s/crashloop-pod.yaml` |
 | Model in `.env` | `claude-3-5-sonnet-latest` | `.env.example` uses `claude-opus-5-5`; always confirm availability in your account |
 | Demo application (`k8s/demo.yaml`) | NGINX (`nginx:stable`) Deployment only | Apache HTTPD (`httpd:2.4`) Deployment **and** a `ClusterIP` Service, both named `demo-web` |
 | Broken Pod image | `nginx:tag-that-does-not-exist` | `httpd:tag-that-does-not-exist` |
@@ -2969,9 +3369,9 @@ These items are mentioned in the manual or are common expectations, but they are
 2. **Restart safety checkpoint.** `manual.docs` mentions "a safety checkpoint before any restart action". No restart action exists, so there is no checkpoint.
 3. **`create_report()` tool.** The manual lists it as an example tool name. The actual function is `reporting.create_markdown_report()`, and it is not a LangChain tool.
 4. **Model-driven tool selection.** The LangChain tools are defined but are called by Python in a fixed order. They are not bound to Claude.
-5. **Previous-container logs** (`kubectl logs --previous`) are not collected.
+5. **Previous-container logs can be missed by timing.** `kubectl logs --previous` is collected, but while a crashed container waits to restart, the older run may already be removed. The current logs then contain the crash output instead.
 6. **`K8S_NAMESPACE`** has no effect when running `main.py`, because `main.py` and `agent_tools.py` use their own default `ai-sre-lab`. Use `--namespace`.
 7. **Pinned dependency versions.** `requirements.txt` is unpinned. The tested versions are listed in Phase 3.
 8. **Service investigation.** The demo application has a Service, but the agent investigates Pods only. It does not check Services, endpoints, or Ingress.
-9. **Recorded AI output.** The recorded runs used a placeholder API key, so no real Claude analysis is shown in this guide. Configure a real key and model ID to see it.
+9. **AI output varies.** Claude's analysis is generated fresh on every run, so wording, structure details, and length differ between runs even for the same Pod. The twelve requested RCA sections are always asked for, but not enforced by code.
 10. **Docker, kubectl, and k3d install steps** are not specified in detail in `manual.docs`; it refers to the official instructions. The commands in Phase 1 follow those official sources and may need adjusting as upstream instructions change.

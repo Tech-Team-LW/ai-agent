@@ -37,6 +37,7 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
     metrics = evidence.get("metrics", {})
     events = evidence.get("events", {})
     logs = evidence.get("logs", {})
+    previous_logs = evidence.get("previous_logs", {})
     description = evidence.get("description", {})
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -49,7 +50,7 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
         if metrics.get("error"):
             metrics_note += f"\n\nKubernetes said: `{metrics['error']}`"
 
-    content = f"""# Kubernetes Pod Incident Report
+    content = f"""# Kubernetes Pod Incident and Root Cause Analysis (RCA) Report
 
 - **Generated at (local time):** {datetime.now().isoformat(timespec="seconds")}
 - **Evidence collected at (UTC):** {evidence.get("collected_at_utc", "Unknown")}
@@ -94,13 +95,19 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
 {logs.get("logs", logs.get("error", "Unavailable"))}
 ```
 
+## Previous container logs (before the last restart)
+
+```text
+{previous_logs.get("logs", previous_logs.get("error", "Unavailable"))}
+```
+
 ## Pod description
 
 ```text
 {description.get("description", description.get("error", "Unavailable"))[:8000]}
 ```
 
-## AI investigation
+## Root cause analysis (AI-generated, advisory)
 
 {ai_explanation}
 

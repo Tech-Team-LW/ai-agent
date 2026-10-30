@@ -81,7 +81,8 @@ def get_pod_status(pod_name, namespace=DEFAULT_NAMESPACE):
             "ready": item.get("ready", False),
             "restart_count": item.get("restartCount", 0),
             "waiting_reason": waiting_reason,
-            "state": state
+            "state": state,
+            "last_state": item.get("lastState", {})
         })
 
     return {
@@ -109,11 +110,30 @@ def get_pod_logs(pod_name, namespace=DEFAULT_NAMESPACE, tail=80):
     return {"ok": True, "logs": result["output"] or "(No log lines returned)"}
 
 
+def get_pod_previous_logs(pod_name, namespace=DEFAULT_NAMESPACE, tail=80):
+    """Read logs from the previous (crashed or restarted) container instance."""
+    result = run_kubectl([
+        "logs", pod_name, "-n", namespace, "--all-containers=true",
+        "--previous", f"--tail={int(tail)}"
+    ])
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "note": "No previous container logs. This is normal if the container "
+                    "has never restarted or never started.",
+            "error": result["error"]
+        }
+    return {"ok": True, "logs": result["output"] or "(No log lines returned)"}
+
+
 def get_pod_events(pod_name, namespace=DEFAULT_NAMESPACE):
     result = run_kubectl([
         "get", "events", "-n", namespace,
         "--field-selector", f"involvedObject.name={pod_name}",
-        "--sort-by=.lastTimestamp", "-o", "wide"
+        "--sort-by=.lastTimestamp",
+        "-o", "custom-columns=FIRST_SEEN:.firstTimestamp,LAST_SEEN:.lastTimestamp,"
+              "COUNT:.count,TYPE:.type,REASON:.reason,SOURCE:.source.component,"
+              "MESSAGE:.message"
     ])
     if not result["ok"]:
         return result
@@ -151,5 +171,6 @@ def collect_pod_evidence(pod_name, namespace=DEFAULT_NAMESPACE):
         "metrics": get_pod_metrics(pod_name, namespace),
         "events": get_pod_events(pod_name, namespace),
         "logs": get_pod_logs(pod_name, namespace),
+        "previous_logs": get_pod_previous_logs(pod_name, namespace),
         "description": get_pod_description(pod_name, namespace)
     }

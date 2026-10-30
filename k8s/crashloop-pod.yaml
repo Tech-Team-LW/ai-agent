@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashloop-demo
+  namespace: ai-sre-lab
+  labels:
+    app: crashloop-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "Starting payment-api v1.4.2"
+          echo "Loading configuration from /etc/app/config.yaml"
+          echo "ERROR: configuration file /etc/app/config.yaml not found" >&2
+          exit 1
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "100m"
+          memory: "32Mi"

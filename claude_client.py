@@ -11,18 +11,47 @@ PLACEHOLDER_KEY = "replace_with_your_real_key"
 
 def build_prompt(evidence):
     return f"""
-You are a careful DevOps incident investigator.
+You are a careful Site Reliability Engineer writing a Root Cause Analysis (RCA)
+for one Kubernetes pod.
 Use only the evidence below. Do not invent CPU, RAM, timestamps, or events.
 "metrics" is live usage from kubectl top. "configured_resources" are requests
 and limits from the pod spec. Never present a request or limit as actual usage.
 If CPU/RAM metrics are unavailable, say so.
+"last_state" and "previous_logs" describe the previous container run (for
+example an OOMKilled or crashed container). Use them when the pod restarted.
+Event times in "events" are absolute UTC timestamps; use them for the timeline.
 
-Write these sections in Markdown:
-1. Incident summary
-2. Confirmed observations (facts directly visible in the evidence)
-3. Possible causes (hypotheses, clearly labelled as not yet confirmed)
-4. Recommended next checks (read-only commands first)
-5. Confidence level (low, medium, or high) and why
+Write the RCA in Markdown with exactly these sections, using level-3 headings
+(###), so it fits inside the report:
+### 1. Executive summary
+Two or three sentences: what failed, the root cause, and the current state.
+### 2. Problem statement
+Pod, namespace, node, symptom, and when it was first observed.
+### 3. Impact
+What is affected according to the evidence (for example: container never
+started, no logs, restarts). Say "unknown" for anything the evidence cannot show.
+### 4. Timeline (UTC)
+A table of events in time order, taken only from timestamps in the evidence.
+### 5. Confirmed observations
+Facts directly visible in the evidence.
+### 6. Root cause
+Label it "Confirmed root cause" only if the evidence directly proves it.
+Otherwise label it "Most likely root cause (not confirmed)" and say what is
+missing. If the pod is healthy and shows no failure, write "No incident
+detected" and explain why; do not invent a root cause.
+### 7. Contributing factors
+Configuration or conditions that made the problem possible or worse.
+### 8. Five whys
+A short chain from the symptom to the root cause. Stop where the evidence ends.
+### 9. Corrective actions
+Immediate fix steps for a human to review and run. Mark each as
+"not performed by the agent; requires human approval".
+### 10. Preventive actions
+Changes that would stop this from happening again.
+### 11. Verification steps
+Read-only commands to confirm the fix worked.
+### 12. Confidence level and evidence gaps
+Low, medium, or high, and why. List evidence that would raise confidence.
 
 Do not claim you changed the cluster.
 
