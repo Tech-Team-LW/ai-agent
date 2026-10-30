@@ -1,0 +1,685 @@
+AGENTIC AI FOR DEVOPS
+& IT AUTOMATION
+Build Your Own AI-Powered Incident Investigation Agent
+From Python code to an intelligent infrastructure investigator. Build an agent that checks a real Kubernetes pod, gathers evidence, explains possible failures, and creates a professional incident report.
+RHEL 10  |  k3d Kubernetes  |  Python  |  Claude API  |  LangChain
+8 Phases  |  Practical, beginner-friendly build
+
+What you will build
+•	A Python application that accepts a pod name and namespace.
+•	Diagnostic tools that read actual pod status, events, logs, labels, node placement, and resource usage.
+•	A Claude-powered explanation that separates observed facts from likely causes.
+•	A safety checkpoint before any restart action. The first version focuses on investigation and reporting.
+•	A real Markdown report saved on disk with pod name, namespace, status, node, CPU usage, RAM usage, events, and recommendations.
+•	Automated tests for report creation, missing pods, namespace handling, and safe error handling.
+Simple project story
+Imagine a developer says: “My application pod is not working.” Instead of manually running many commands, you run one Python program. The program checks Kubernetes, collects real evidence, asks Claude to explain that evidence, and saves a report. The agent does not invent CPU or RAM values: if Kubernetes metrics are unavailable, the report clearly says so.
+Eight-phase plan
+Phase	What we do	Result
+1	Prepare RHEL 10, Python, Docker, k3d and kubectl	Local lab ready
+2	Create a Kubernetes cluster and run a sample pod	Real pod running
+3	Create the Python project and connect to Kubernetes	Python can inspect pods
+4	Build simple diagnostic tools	Status, logs, events and metrics
+5	Connect Claude API and LangChain	AI explains collected evidence
+6	Build the investigation flow and safety rules	Controlled investigation
+7	Test healthy and broken scenarios	Tests and troubleshooting
+8	Run a pod and ask the reporting tool for a real report	Markdown report with CPU/RAM/name/namespace
+
+ Before we start: understand the main words
+What is an AI agent?
+A normal chatbot mainly answers your question. An AI agent can follow a task, use tools, inspect results, and then produce an answer. In this project, Python controls the process and Claude helps explain the evidence.
+What is a tool?
+A tool is a normal Python function that the agent can use. Examples: get_pod_status(), get_pod_logs(), get_pod_events(), get_pod_metrics(), and create_report(). A tool must return real data or a clear error.
+What is LangChain?
+LangChain provides a standard way to describe Python functions as tools and connect them to language models. We keep the project intentionally small: a few readable functions instead of a large framework.
+What is a real report?
+The report is built from the Kubernetes API and kubectl metrics. Claude can explain the collected facts, but it must not invent missing measurements. CPU and RAM usage normally require Metrics Server. If metrics are not available, the report marks them as unavailable rather than showing made-up values.
+Important lab notes
+•	Use this lab on a test machine or local cluster, not a production cluster.
+•	Do not commit the .env file or API key to Git.
+•	The report tool is read-only. It does not delete or restart pods.
+•	A successful install depends on internet access, Docker, package repositories, API access, and compatible versions. No guide can guarantee every machine is identical.
+•	Use the same namespace consistently: ai-sre-lab.
+PHASE 1 — Prepare RHEL 10
+Goal: install the basic tools and confirm that Docker, kubectl, and k3d work.
+Step 1.1 — Update the system
+sudo dnf update -y
+sudo dnf install -y curl git vim tar gzip
+Step 1.2 — Install Python tools
+sudo dnf install -y python3 python3-pip python3-devel gcc
+Step 1.3 — Check Docker
+If Docker is already installed, start and test it. If it is not installed, install Docker Engine using the official Docker instructions for RHEL-compatible systems, then return here.
+sudo systemctl enable --now docker
+sudo systemctl status docker --no-pager
+docker version
+If your user cannot run Docker, use sudo for Docker commands or add your user to the docker group and sign in again. Membership in the docker group grants powerful host access.
+Step 1.4 — Install kubectl and k3d
+Install the current stable kubectl binary and k3d from their official installation instructions. Then verify:
+kubectl version --client
+k3d version
+docker ps
+If these commands work, continue. If a command is missing, finish its official installation before moving on.
+PHASE 2 — Create the cluster and run a pod
+Goal: create a small local Kubernetes cluster and run NGINX as the application we will investigate.
+Step 2.1 — Create the k3d cluster
+k3d cluster create pod-lab --agents 1 --servers 1
+Step 2.2 — Check the cluster
+kubectl cluster-info
+kubectl get nodes
+Step 2.3 — Create the namespace
+kubectl create namespace ai-sre-lab
+If the namespace already exists, that is okay. You can check it with:
+kubectl get namespace ai-sre-lab
+Step 2.4 — Create a sample Deployment
+Create the folder first:
+mkdir -p ~/pod-investigation-agent/k8s
+cd ~/pod-investigation-agent
+Create the following file. A Deployment keeps the NGINX pod running if it exits.
+Full file path: ~/pod-investigation-agent/k8s/demo.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-web
+  namespace: ai-sre-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-web
+  template:
+    metadata:
+      labels:
+        app: demo-web
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+Apply the file and wait for the pod:
+kubectl apply -f ~/pod-investigation-agent/k8s/demo.yaml
+kubectl rollout status deployment/demo-web -n ai-sre-lab
+kubectl get pods -n ai-sre-lab -o wide
+Write down the pod name shown by the last command. It will usually look like demo-web- followed by a generated suffix.
+PHASE 3 — Create the Python project
+Goal: keep the files in one place and install Python packages inside a virtual environment.
+Step 3.1 — Create folders
+mkdir -p ~/pod-investigation-agent/reports ~/pod-investigation-agent/tests
+cd ~/pod-investigation-agent
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+Step 3.2 — Create requirements.txt
+These are the packages used by this project.
+Full file path: ~/pod-investigation-agent/requirements.txt
+anthropic
+langchain-core
+python-dotenv
+pytest
+cd ~/pod-investigation-agent
+source .venv/bin/activate
+pip install -r requirements.txt
+Step 3.3 — Create .gitignore
+Full file path: ~/pod-investigation-agent/.gitignore
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+reports/*.md
+Step 3.4 — Create the API configuration
+Create an Anthropic API key from your approved Anthropic account. Put the key in the .env file on your own machine. Do not paste it into a public chat, screenshot, or Git repository.
+Full file path: ~/pod-investigation-agent/.env
+ANTHROPIC_API_KEY=replace_with_your_real_key
+ANTHROPIC_MODEL=claude-3-5-sonnet-latest
+K8S_NAMESPACE=ai-sre-lab
+REPORT_DIR=reports
+If the model name is not available to your account, replace it with a currently supported Claude model name available to you. API model availability can change.
+PHASE 4 — Build the diagnostic tools
+Goal: create simple Python functions that read real Kubernetes information. We use kubectl because it is already configured to talk to the local cluster.
+Step 4.1 — Create pod_tools.py
+This file runs read-only kubectl commands. It checks the pod, logs, events, and resource metrics. All commands use a fixed namespace supplied by configuration or an explicit argument.
+Full file path: ~/pod-investigation-agent/pod_tools.py
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+ 
+from dotenv import load_dotenv
+ 
+load_dotenv()
+ 
+DEFAULT_NAMESPACE = os.getenv("K8S_NAMESPACE", "ai-sre-lab")
+ 
+ 
+def run_kubectl(args, timeout=20):
+    """Run kubectl safely and return stdout or a readable error."""
+    command = ["kubectl"] + list(args)
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"Command timed out: {' '.join(command)}"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "kubectl was not found. Install kubectl first."}
+ 
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "error": result.stderr.strip() or result.stdout.strip()
+        }
+    return {"ok": True, "output": result.stdout.strip()}
+ 
+ 
+def get_pod_status(pod_name, namespace=DEFAULT_NAMESPACE):
+    result = run_kubectl([
+        "get", "pod", pod_name, "-n", namespace, "-o", "json"
+    ])
+    if not result["ok"]:
+        return result
+ 
+    pod = json.loads(result["output"])
+    statuses = pod.get("status", {}).get("containerStatuses", [])
+    return {
+        "ok": True,
+        "name": pod["metadata"]["name"],
+        "namespace": pod["metadata"]["namespace"],
+        "phase": pod.get("status", {}).get("phase", "Unknown"),
+        "node": pod.get("spec", {}).get("nodeName", "Not scheduled"),
+        "pod_ip": pod.get("status", {}).get("podIP", "Not assigned"),
+        "created": pod.get("metadata", {}).get("creationTimestamp", "Unknown"),
+        "labels": pod.get("metadata", {}).get("labels", {}),
+        "containers": [
+            {
+                "name": item.get("name", "unknown"),
+                "ready": item.get("ready", False),
+                "restart_count": item.get("restartCount", 0),
+                "state": item.get("state", {})
+            }
+            for item in statuses
+        ],
+        "owner_references": pod.get("metadata", {}).get("ownerReferences", [])
+    }
+ 
+ 
+def get_pod_logs(pod_name, namespace=DEFAULT_NAMESPACE, tail=80):
+    result = run_kubectl([
+        "logs", pod_name, "-n", namespace, "--all-containers=true",
+        f"--tail={int(tail)}"
+    ])
+    if not result["ok"]:
+        return result
+    return {"ok": True, "logs": result["output"] or "(No log lines returned)"}
+ 
+ 
+def get_pod_events(pod_name, namespace=DEFAULT_NAMESPACE):
+    result = run_kubectl([
+        "get", "events", "-n", namespace,
+        "--field-selector", f"involvedObject.name={pod_name}",
+        "--sort-by=.lastTimestamp", "-o", "wide"
+    ])
+    if not result["ok"]:
+        return result
+    return {"ok": True, "events": result["output"] or "(No events returned)"}
+ 
+ 
+def get_pod_metrics(pod_name, namespace=DEFAULT_NAMESPACE):
+    """Read live CPU/RAM usage from Metrics Server via kubectl top."""
+    result = run_kubectl([
+        "top", "pod", pod_name, "-n", namespace, "--containers"
+    ])
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "cpu_ram": "Unavailable",
+            "note": "kubectl top failed. Metrics Server may not be installed, "
+                    "may not be ready, or the pod may not have metrics yet.",
+            "error": result["error"]
+        }
+    return {"ok": True, "cpu_ram": result["output"]}
+ 
+ 
+def get_pod_description(pod_name, namespace=DEFAULT_NAMESPACE):
+    result = run_kubectl(["describe", "pod", pod_name, "-n", namespace])
+    if not result["ok"]:
+        return result
+    return {"ok": True, "description": result["output"]}
+ 
+ 
+def collect_pod_evidence(pod_name, namespace=DEFAULT_NAMESPACE):
+    """Gather the evidence used by the AI and the report writer."""
+    return {
+        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pod": get_pod_status(pod_name, namespace),
+        "metrics": get_pod_metrics(pod_name, namespace),
+        "events": get_pod_events(pod_name, namespace),
+        "logs": get_pod_logs(pod_name, namespace),
+        "description": get_pod_description(pod_name, namespace)
+    }
+Step 4.2 — Test the tools from the terminal
+kubectl get pods -n ai-sre-lab
+kubectl top pod -n ai-sre-lab
+kubectl describe pod -n ai-sre-lab
+The first command should show your pod. The second command needs Metrics Server. If `kubectl top` fails, continue with the Metrics Server step below; the report will clearly mark CPU/RAM as unavailable until metrics work.
+Step 4.3 — Enable CPU/RAM metrics if needed
+A fresh k3d cluster may not include Metrics Server. Install it using its official Kubernetes release manifest, then check its pod. The command below downloads a live upstream manifest, so run it only if your lab permits fetching official Kubernetes components.
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system get deployment metrics-server
+If Metrics Server cannot scrape the local k3d kubelet because of certificate verification, do not silently ignore the error. For a disposable local training cluster only, you can configure Metrics Server to use `--kubelet-insecure-tls`; this weakens kubelet certificate validation and must not be copied to production. After the change, wait for the deployment and test `kubectl top pod -n ai-sre-lab` again.
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s
+kubectl top pod -n ai-sre-lab
+PHASE 5 — Connect Claude and LangChain
+Goal: send collected evidence to Claude for an explanation. We do not ask Claude to guess values; we provide the real tool output.
+Step 5.1 — Create claude_client.py
+Full file path: ~/pod-investigation-agent/claude_client.py
+import json
+import os
+ 
+from anthropic import Anthropic
+from dotenv import load_dotenv
+ 
+load_dotenv()
+ 
+ 
+def explain_incident(evidence):
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    model = os.getenv("ANTHROPIC_MODEL")
+ 
+    if not api_key or api_key == "replace_with_your_real_key":
+        return (
+            "AI explanation unavailable: set a valid ANTHROPIC_API_KEY in .env. "
+            "The collected Kubernetes evidence is still included in the report."
+        )
+    if not model:
+        return "AI explanation unavailable: set ANTHROPIC_MODEL in .env."
+ 
+    prompt = f"""
+You are a careful DevOps incident investigator.
+Use only the evidence below. Do not invent CPU, RAM, timestamps, or events.
+Separate confirmed observations from hypotheses.
+If CPU/RAM metrics are unavailable, say so.
+Give a short incident summary, likely cause, evidence, recommended next checks,
+and a confidence level. Do not claim you changed the cluster.
+ 
+EVIDENCE JSON:
+{json.dumps(evidence, indent=2)[:18000]}
+"""
+    try:
+        client = Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=900,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        pieces = []
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                pieces.append(block.text)
+        return "\n".join(pieces).strip() or "Claude returned no text."
+    except Exception as exc:
+        return f"AI explanation unavailable: {type(exc).__name__}: {exc}"
+Step 5.2 — Create LangChain tools
+LangChain tools make Python functions available in a consistent tool format. This beginner version uses the tools directly from Python, so the workflow remains easy to understand and test.
+Full file path: ~/pod-investigation-agent/agent_tools.py
+from langchain_core.tools import tool
+from dotenv import load_dotenv
+ 
+from pod_tools import (
+    get_pod_status,
+    get_pod_logs,
+    get_pod_events,
+    get_pod_metrics,
+)
+ 
+load_dotenv()
+ 
+ 
+@tool
+def inspect_pod(pod_name: str, namespace: str = "ai-sre-lab") -> dict:
+    """Read the current status, node, labels and container state of one pod."""
+    return get_pod_status(pod_name, namespace)
+ 
+ 
+@tool
+def read_pod_logs(pod_name: str, namespace: str = "ai-sre-lab") -> dict:
+    """Read the latest log lines from all containers in one pod."""
+    return get_pod_logs(pod_name, namespace)
+ 
+ 
+@tool
+def read_pod_events(pod_name: str, namespace: str = "ai-sre-lab") -> dict:
+    """Read Kubernetes events related to one pod."""
+    return get_pod_events(pod_name, namespace)
+ 
+ 
+@tool
+def read_pod_cpu_ram(pod_name: str, namespace: str = "ai-sre-lab") -> dict:
+    """Read live pod/container CPU and memory usage using kubectl top."""
+    return get_pod_metrics(pod_name, namespace)
+In simple terms: `@tool` describes what a function does. We call these functions from our controlled Python workflow. This keeps the first version readable and avoids giving the model direct shell access.
+PHASE 6 — Build the investigation and report workflow
+Step 6.1 — Create reporting.py
+This creates a Markdown file using the actual evidence. CPU/RAM are copied from `kubectl top`; if metrics are missing, the report states that clearly.
+Full file path: ~/pod-investigation-agent/reporting.py
+import json
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+ 
+from dotenv import load_dotenv
+ 
+load_dotenv()
+ 
+ 
+def safe_filename(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+ 
+ 
+def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
+    report_dir = Path(os.getenv("REPORT_DIR", "reports"))
+    report_dir.mkdir(parents=True, exist_ok=True)
+ 
+    pod = evidence.get("pod", {})
+    metrics = evidence.get("metrics", {})
+    events = evidence.get("events", {})
+    logs = evidence.get("logs", {})
+    description = evidence.get("description", {})
+ 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_path = report_dir / f"incident_{safe_filename(namespace)}_{safe_filename(pod_name)}_{timestamp}.md"
+ 
+    cpu_ram = metrics.get("cpu_ram", "Unavailable") if metrics.get("ok") else "Unavailable"
+    metrics_note = metrics.get("note", "")
+    if not metrics.get("ok"):
+        metrics_note += " " + metrics.get("error", "")
+ 
+    content = f"""# Kubernetes Pod Incident Report
+ 
+- **Generated at:** {datetime.now().isoformat(timespec="seconds")}
+- **Pod name:** {pod_name}
+- **Namespace:** {namespace}
+- **Status:** {pod.get("phase", "Unknown")}
+- **Node:** {pod.get("node", "Unknown")}
+- **Pod IP:** {pod.get("pod_ip", "Unknown")}
+- **Created:** {pod.get("created", "Unknown")}
+ 
+## CPU and RAM usage
+ 
+```text
+{cpu_ram}
+```
+ 
+{metrics_note}
+ 
+> CPU/RAM above is live usage from Kubernetes Metrics Server when available. It is not the pod's configured limit. If marked unavailable, no usage number was invented.
+ 
+## Container state
+ 
+```json
+{json.dumps(pod.get("containers", []), indent=2)}
+```
+ 
+## Kubernetes events
+ 
+```text
+{events.get("events", events.get("error", "Unavailable"))}
+```
+ 
+## Recent logs
+ 
+```text
+{logs.get("logs", logs.get("error", "Unavailable"))}
+```
+ 
+## Pod description
+ 
+```text
+{description.get("description", description.get("error", "Unavailable"))[:8000]}
+```
+ 
+## AI investigation
+ 
+{ai_explanation}
+ 
+## Verification and limitations
+ 
+- This report is based on evidence collected from the current Kubernetes cluster.
+- The AI explanation is advisory; verify recommendations before making changes.
+- This program did not restart, delete, or modify the pod.
+- Missing metrics or unavailable logs are reported as unavailable, not guessed.
+"""
+    file_path.write_text(content, encoding="utf-8")
+    return str(file_path)
+Step 6.2 — Create main.py
+This is the main entry point. It validates the pod name and namespace, calls the diagnostic tools, asks Claude to explain the evidence, and saves the report.
+Full file path: ~/pod-investigation-agent/main.py
+import argparse
+import json
+import re
+ 
+from dotenv import load_dotenv
+ 
+from pod_tools import collect_pod_evidence
+from claude_client import explain_incident
+from reporting import create_markdown_report
+from agent_tools import inspect_pod, read_pod_logs, read_pod_events, read_pod_cpu_ram
+ 
+load_dotenv()
+ 
+NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+ 
+ 
+def validate_name(value, label):
+    if not value or len(value) > 253 or not NAME_PATTERN.fullmatch(value):
+        raise ValueError(f"Invalid {label}: {value!r}")
+    return value
+ 
+ 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Investigate a Kubernetes pod and create a Markdown report."
+    )
+    parser.add_argument("--pod", required=True, help="Exact pod name")
+    parser.add_argument("--namespace", default="ai-sre-lab", help="Kubernetes namespace")
+    args = parser.parse_args()
+ 
+    pod_name = validate_name(args.pod, "pod name")
+    namespace = validate_name(args.namespace, "namespace")
+ 
+    print("\n[1/5] Checking pod status with LangChain tool...")
+    status = inspect_pod.invoke({"pod_name": pod_name, "namespace": namespace})
+    if not status.get("ok"):
+        print("Could not inspect pod:", status.get("error", status))
+        print("Check the pod name and namespace using: kubectl get pods -n", namespace)
+        raise SystemExit(1)
+    print(json.dumps(status, indent=2))
+ 
+    print("\n[2/5] Reading logs with LangChain tool...")
+    print(read_pod_logs.invoke({"pod_name": pod_name, "namespace": namespace}))
+ 
+    print("\n[3/5] Reading events with LangChain tool...")
+    print(read_pod_events.invoke({"pod_name": pod_name, "namespace": namespace}))
+ 
+    print("\n[4/5] Reading CPU/RAM with LangChain tool...")
+    print(read_pod_cpu_ram.invoke({"pod_name": pod_name, "namespace": namespace}))
+ 
+    print("\n[5/5] Collecting full evidence and generating the report...")
+    evidence = collect_pod_evidence(pod_name, namespace)
+    explanation = explain_incident(evidence)
+    report_path = create_markdown_report(
+        pod_name, namespace, evidence, explanation
+    )
+ 
+    print("\nReport created successfully:")
+    print(report_path)
+    print("\nOpen it with:")
+    print(f"cat {report_path}")
+ 
+ 
+if __name__ == "__main__":
+    main()
+Safety note: this version is intentionally read-only. It investigates and reports, but does not automatically restart or delete a pod. This is a good first production-style safety boundary.
+PHASE 7 — Test the project
+Goal: test both normal and error situations before the final live report demo.
+Step 7.1 — Create test_pod_tools.py
+These tests check that command construction is safe and that the report can be generated from supplied evidence. They do not require a live Kubernetes cluster.
+Full file path: ~/pod-investigation-agent/tests/test_pod_tools.py
+from pod_tools import get_pod_metrics
+from reporting import create_markdown_report
+ 
+ 
+def test_metrics_error_is_reported(monkeypatch):
+    import pod_tools
+ 
+    monkeypatch.setattr(
+        pod_tools,
+        "run_kubectl",
+        lambda args, timeout=20: {"ok": False, "error": "metrics unavailable"}
+    )
+    result = get_pod_metrics("demo-web-abc", "ai-sre-lab")
+    assert result["ok"] is False
+    assert result["cpu_ram"] == "Unavailable"
+    assert "metrics unavailable" in result["error"]
+ 
+ 
+def test_report_contains_pod_identity_and_metrics(tmp_path, monkeypatch):
+    import reporting
+ 
+    monkeypatch.setenv("REPORT_DIR", str(tmp_path))
+    evidence = {
+        "pod": {
+            "phase": "Running",
+            "node": "k3d-pod-lab-agent-0",
+            "pod_ip": "10.42.0.10",
+            "created": "2026-10-30T00:00:00Z",
+            "containers": [{"name": "nginx", "ready": True, "restart_count": 0}]
+        },
+        "metrics": {"ok": True, "cpu_ram": "nginx 2m 12Mi"},
+        "events": {"ok": True, "events": "No events"},
+        "logs": {"ok": True, "logs": "nginx started"},
+        "description": {"ok": True, "description": "Pod description"}
+    }
+    path = create_markdown_report(
+        "demo-web-abc", "ai-sre-lab", evidence, "No issue observed."
+    )
+    content = open(path, encoding="utf-8").read()
+    assert "demo-web-abc" in content
+    assert "ai-sre-lab" in content
+    assert "nginx 2m 12Mi" in content
+    assert "No issue observed." in content
+ 
+ 
+def test_report_marks_missing_metrics(tmp_path, monkeypatch):
+    monkeypatch.setenv("REPORT_DIR", str(tmp_path))
+    evidence = {
+        "pod": {"phase": "Running", "node": "node-1"},
+        "metrics": {"ok": False, "cpu_ram": "Unavailable", "note": "Metrics Server missing"},
+        "events": {"events": "Unavailable"},
+        "logs": {"logs": "Unavailable"},
+        "description": {"description": "Unavailable"}
+    }
+    path = create_markdown_report(
+        "demo-web-abc", "ai-sre-lab", evidence, "Metrics not available."
+    )
+    content = open(path, encoding="utf-8").read()
+    assert "Unavailable" in content
+    assert "Metrics Server missing" in content
+Step 7.2 — Run the automated tests
+cd ~/pod-investigation-agent
+source .venv/bin/activate
+pytest -q
+Expected result: three tests pass. If a test fails, read the first traceback line that points to your project file, fix that issue, and run pytest again.
+Step 7.3 — Test a missing pod
+python main.py --pod pod-that-does-not-exist --namespace ai-sre-lab
+Expected result: the program prints a clear Kubernetes error and exits. It should not create a misleading report for a pod that does not exist.
+Step 7.4 — Create a controlled broken pod
+This test creates a pod that cannot download its image. It is useful for observing ImagePullBackOff. It is safe for the lab because it does not alter the healthy Deployment.
+Full file path: ~/pod-investigation-agent/k8s/broken-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: broken-image-demo
+  namespace: ai-sre-lab
+  labels:
+    app: broken-image-demo
+spec:
+  containers:
+    - name: web
+      image: nginx:tag-that-does-not-exist
+kubectl apply -f ~/pod-investigation-agent/k8s/broken-pod.yaml
+kubectl get pod broken-image-demo -n ai-sre-lab -w
+Wait until the status becomes ErrImagePull or ImagePullBackOff, then press Ctrl+C to stop watching. Run the agent against the broken pod in Phase 8. It should collect events that point to the image-pull problem.
+Troubleshooting checklist
+•	kubectl cannot connect: run `kubectl get nodes` and check `k3d cluster list`.
+•	Pod name not found: run `kubectl get pods -n ai-sre-lab` and copy the exact name.
+•	Logs unavailable: check whether the container has started; a failed image pull often has events but no application logs.
+•	`kubectl top` fails: check Metrics Server deployment and wait for metrics to become available.
+•	Claude API fails: verify the key, account access, model name, network access, and API quota. The report should still be created with an AI-unavailable note.
+•	Package import fails: activate `.venv` and run `pip install -r requirements.txt` again.
+PHASE 8 — Run a pod and generate a real incident report
+This is the final practical. You will run the tool against a real pod in your k3d cluster. The report includes the exact pod name, namespace, status, node, CPU usage and RAM usage when Metrics Server is available, plus logs, events, and Claude's evidence-based explanation.
+Step 8.1 — Make sure a pod is running
+kubectl get pods -n ai-sre-lab -o wide
+kubectl rollout status deployment/demo-web -n ai-sre-lab
+Copy the exact pod name from the output. Example names change every time, so do not blindly copy the example name.
+Step 8.2 — Run the reporting agent for the healthy pod
+Replace `<REAL_POD_NAME>` with the pod name you copied. Keep the namespace as `ai-sre-lab`.
+cd ~/pod-investigation-agent
+source .venv/bin/activate
+python main.py --pod <REAL_POD_NAME> --namespace ai-sre-lab
+The terminal will show five stages: pod inspection, logs, events, CPU/RAM metrics, and report creation. The final line prints the path to the generated Markdown report.
+Step 8.3 — Open and inspect the report
+ls -lh ~/pod-investigation-agent/reports
+cat ~/pod-investigation-agent/reports/incident_ai-sre-lab_<POD_NAME>_<TIMESTAMP>.md
+Use the exact filename printed by the program rather than typing the placeholder literally. The report should contain:
+•	Pod name and namespace.
+•	Current pod phase, node, pod IP, creation time, and container readiness/restart counts.
+•	Live CPU and memory usage from `kubectl top`, if available.
+•	Recent pod events and logs.
+•	An AI investigation with observations, likely cause, recommendations, and uncertainty.
+•	A note confirming that the tool did not change the cluster.
+Step 8.4 — Generate a report for the broken pod
+python main.py --pod broken-image-demo --namespace ai-sre-lab
+Expected finding: the pod is likely Pending and/or in ImagePullBackOff because the requested image tag does not exist. The event output should support this explanation. CPU/RAM may be unavailable because the container never started. The agent should say that rather than inventing metrics.
+Step 8.5 — Compare the two reports
+Check	Healthy pod	Broken image pod
+Pod name / namespace	Actual Deployment pod / ai-sre-lab	broken-image-demo / ai-sre-lab
+Status	Usually Running	Usually Pending / image-pull failure
+CPU and RAM	Usually available after metrics start	May be unavailable if container never starts
+Evidence	Container state, logs, events	Image pull events and pod description
+AI conclusion	Report current observations	Likely image tag/pull problem, backed by events
+Step 8.6 — Clean up the broken test pod
+kubectl delete pod broken-image-demo -n ai-sre-lab
+This deletes only the deliberately broken test pod. It does not delete the healthy Deployment.
+Final project checklist
+•	RHEL 10 lab and k3d cluster are working.
+•	The healthy NGINX Deployment is running.
+•	Python virtual environment and packages are installed.
+•	Diagnostic tools can read pod status, logs, events, and metrics.
+•	Claude explanation works, or the report clearly records why AI was unavailable.
+•	Automated tests pass.
+•	A report for a healthy pod is saved.
+•	A report for a broken-image pod is saved.
+•	Each report includes pod name and namespace and either real CPU/RAM usage or an honest unavailable message.
+•	No automatic restart, deletion, or other remediation occurs.
+Final deliverables
+•	Python source files: pod_tools.py, agent_tools.py, claude_client.py, reporting.py, main.py
+•	Kubernetes YAML files: demo.yaml and broken-pod.yaml
+•	Configuration template in .env (keep the real API key private)
+•	Automated test file and test results
+•	Markdown RCA reports in the reports/ folder
+•	A repeatable command to investigate any pod in the selected namespace
+One-command reminder
+After you know the pod name, the final command is:
+python main.py --pod <REAL_POD_NAME> --namespace ai-sre-lab
+Remember: the AI is an assistant to the investigation, not a replacement for evidence. Kubernetes supplies the facts; the program records them; Claude explains them; you decide what to do next.
+

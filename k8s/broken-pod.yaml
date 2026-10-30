@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: broken-image-demo
+  namespace: ai-sre-lab
+  labels:
+    app: broken-image-demo
+spec:
+  containers:
+    - name: web
+      image: httpd:tag-that-does-not-exist
