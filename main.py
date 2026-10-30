@@ -1,23 +1,13 @@
+# main.py
+# Start LW-RCA-analyzer from the terminal:
+#   python main.py --pod <pod-name> --namespace ai-sre-lab
+# Leave out --pod to choose a pod from a list.
+
 import argparse
-import json
-import re
 
-from dotenv import load_dotenv
-
-from pod_tools import collect_pod_evidence, list_pods
-from claude_client import explain_incident
+from agent import AGENT_NAME, investigate_pod
+from pod_tools import collect_pod_evidence, get_pod_status, list_pods, validate_name
 from reporting import create_markdown_report
-from agent_tools import inspect_pod, read_pod_logs, read_pod_events, read_pod_cpu_ram
-
-load_dotenv()
-
-NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
-
-
-def validate_name(value, label):
-    if not value or len(value) > 253 or not NAME_PATTERN.fullmatch(value):
-        raise ValueError(f"Invalid {label}: {value!r}")
-    return value
 
 
 def choose_pod(namespace):
@@ -41,13 +31,15 @@ def choose_pod(namespace):
 
 
 def main():
+    # 1. Read the command-line options.
     parser = argparse.ArgumentParser(
-        description="Investigate a Kubernetes pod and create a Markdown RCA report."
+        description=f"{AGENT_NAME}: investigate a Kubernetes pod and write an RCA report."
     )
     parser.add_argument("--pod", help="Exact pod name (leave out to choose from a list)")
     parser.add_argument("--namespace", default="ai-sre-lab", help="Kubernetes namespace")
     args = parser.parse_args()
 
+    # 2. Check the names, so only safe names reach kubectl.
     try:
         namespace = validate_name(args.namespace, "namespace")
         pod_name = args.pod or choose_pod(namespace)
@@ -57,31 +49,26 @@ def main():
         print("Names may only use lowercase letters, numbers, '-' and '.'.")
         raise SystemExit(1)
 
-    print(f"\nInvestigating pod {pod_name} in namespace {namespace} (read-only).")
+    print(f"\n=== {AGENT_NAME} ===")
+    print(f"Investigating pod {pod_name} in namespace {namespace} (read-only).")
 
-    print("\n[1/5] Checking pod status with LangChain tool...")
-    status = inspect_pod.invoke({"pod_name": pod_name, "namespace": namespace})
-    if not status.get("ok"):
-        print("Could not inspect pod:", status.get("error", status))
-        print("Check the pod name and namespace using: kubectl get pods -n", namespace)
+    # 3. Make sure the pod exists before calling the AI.
+    print("\n[1/3] Checking that the pod exists...")
+    status = get_pod_status(pod_name, namespace)
+    if not status["ok"]:
+        print("Could not find the pod:", status["error"])
+        print("Check the pod name and namespace with: kubectl get pods -n", namespace)
         raise SystemExit(1)
-    print(json.dumps(status, indent=2))
+    print(f"Pod found: phase={status['phase']}, node={status['node']}")
 
-    print("\n[2/5] Reading logs with LangChain tool...")
-    print(read_pod_logs.invoke({"pod_name": pod_name, "namespace": namespace}))
+    # 4. Let the AI agent investigate. It prints each tool it uses.
+    print(f"\n[2/3] {AGENT_NAME} is investigating (Claude chooses the read-only tools)...")
+    rca, steps = investigate_pod(pod_name, namespace)
 
-    print("\n[3/5] Reading events with LangChain tool...")
-    print(read_pod_events.invoke({"pod_name": pod_name, "namespace": namespace}))
-
-    print("\n[4/5] Reading CPU/RAM with LangChain tool...")
-    print(read_pod_cpu_ram.invoke({"pod_name": pod_name, "namespace": namespace}))
-
-    print("\n[5/5] Collecting full evidence and asking Claude for a root cause analysis...")
+    # 5. Collect the standard evidence and write the report.
+    print("\n[3/3] Collecting evidence and writing the RCA report...")
     evidence = collect_pod_evidence(pod_name, namespace)
-    explanation = explain_incident(evidence)
-    report_path = create_markdown_report(
-        pod_name, namespace, evidence, explanation
-    )
+    report_path = create_markdown_report(pod_name, namespace, evidence, rca, steps)
 
     print("\nReport created successfully:")
     print(report_path)

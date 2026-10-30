@@ -1,20 +1,26 @@
+# reporting.py
+# Writes the LW-RCA-analyzer report as a Markdown file in the reports/ folder.
+
 import json
 import os
-import re
 from datetime import datetime
-from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-def safe_filename(value):
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+def text_or_error(result, key):
+    """Return result[key] if it exists, otherwise the error message."""
+    if key in result:
+        return result[key]
+    if "error" in result:
+        return result["error"]
+    return "Unavailable"
 
 
-def configured_resources_table(resources):
-    """Build a Markdown table of configured requests and limits."""
+def resources_table(resources):
+    """Build a Markdown table of the configured CPU/RAM requests and limits."""
     if not resources:
         return "Configured requests/limits: Unavailable (pod details could not be read)."
     lines = [
@@ -22,37 +28,57 @@ def configured_resources_table(resources):
         "|---|---|---|---|---|",
     ]
     for item in resources:
-        lines.append(
-            f"| {item['container']} | {item['cpu_request']} | {item['cpu_limit']} "
-            f"| {item['memory_request']} | {item['memory_limit']} |"
-        )
+        lines.append(f"| {item['container']} | {item['cpu_request']} | {item['cpu_limit']} "
+                     f"| {item['memory_request']} | {item['memory_limit']} |")
     return "\n".join(lines)
 
 
-def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
-    report_dir = Path(os.getenv("REPORT_DIR", "reports"))
-    report_dir.mkdir(parents=True, exist_ok=True)
+def steps_list(agent_steps):
+    """Build a Markdown list of the tools the agent used."""
+    if not agent_steps:
+        return "No tools were called by the AI agent."
+    lines = []
+    for item in agent_steps:
+        lines.append(f"- Step {item['step']}: `{item['tool']}` with `{json.dumps(item['input'])}`")
+    return "\n".join(lines)
 
+
+def create_markdown_report(pod_name, namespace, evidence, rca, agent_steps=None):
+    """Write the report file and return its path."""
+    # 1. Make sure the reports folder exists.
+    report_dir = os.getenv("REPORT_DIR", "reports")
+    os.makedirs(report_dir, exist_ok=True)
+
+    # 2. Build the file name, for example: incident_ai-sre-lab_my-pod_20261031_041101.md
+    now = datetime.now()
+    file_name = f"incident_{namespace}_{pod_name}_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    file_path = os.path.join(report_dir, file_name)
+
+    # 3. Take each part of the evidence (an empty dictionary if it is missing).
     pod = evidence.get("pod", {})
     metrics = evidence.get("metrics", {})
-    events = evidence.get("events", {})
-    logs = evidence.get("logs", {})
-    previous_logs = evidence.get("previous_logs", {})
-    description = evidence.get("description", {})
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path = report_dir / f"incident_{safe_filename(namespace)}_{safe_filename(pod_name)}_{timestamp}.md"
-
-    cpu_ram = metrics.get("cpu_ram", "Unavailable") if metrics.get("ok") else "Unavailable"
-    metrics_note = ""
-    if not metrics.get("ok"):
+    # 4. Live CPU/RAM usage. If it failed, explain why instead of inventing numbers.
+    if metrics.get("ok"):
+        cpu_ram = metrics["cpu_ram"]
+        metrics_note = ""
+    else:
+        cpu_ram = "Unavailable"
         metrics_note = "**Live metrics could not be retrieved.** " + metrics.get("note", "")
-        if metrics.get("error"):
+        if "error" in metrics:
             metrics_note += f"\n\nKubernetes said: `{metrics['error']}`"
 
-    content = f"""# Kubernetes Pod Incident and Root Cause Analysis (RCA) Report
+    # 5. The text of each evidence section.
+    events = text_or_error(evidence.get("events", {}), "events")
+    logs = text_or_error(evidence.get("logs", {}), "logs")
+    previous_logs = text_or_error(evidence.get("previous_logs", {}), "logs")
+    description = text_or_error(evidence.get("description", {}), "description")
+    containers = json.dumps(pod.get("containers", []), indent=2)
 
-- **Generated at (local time):** {datetime.now().isoformat(timespec="seconds")}
+    # 6. Put everything into one Markdown document.
+    content = f"""# LW-RCA-analyzer: Kubernetes Pod Incident and Root Cause Analysis (RCA) Report
+
+- **Generated at (local time):** {now.isoformat(timespec="seconds")}
 - **Evidence collected at (UTC):** {evidence.get("collected_at_utc", "Unknown")}
 - **Pod name:** {pod_name}
 - **Namespace:** {namespace}
@@ -73,50 +99,59 @@ def create_markdown_report(pod_name, namespace, evidence, ai_explanation):
 
 ## Configured CPU and RAM (requests and limits from the pod spec)
 
-{configured_resources_table(pod.get("configured_resources", []))}
+{resources_table(pod.get("configured_resources", []))}
 
 > Requests and limits are configuration settings, not measurements.
 
 ## Container state
 
 ```json
-{json.dumps(pod.get("containers", []), indent=2)}
+{containers}
 ```
 
 ## Kubernetes events
 
 ```text
-{events.get("events", events.get("error", "Unavailable"))}
+{events}
 ```
 
 ## Recent logs
 
 ```text
-{logs.get("logs", logs.get("error", "Unavailable"))}
+{logs}
 ```
 
 ## Previous container logs (before the last restart)
 
 ```text
-{previous_logs.get("logs", previous_logs.get("error", "Unavailable"))}
+{previous_logs}
 ```
 
 ## Pod description
 
 ```text
-{description.get("description", description.get("error", "Unavailable"))[:8000]}
+{description}
 ```
+
+## AI agent investigation steps
+
+LW-RCA-analyzer chose these read-only tools itself. Tools with the same step number were called together.
+
+{steps_list(agent_steps)}
 
 ## Root cause analysis (AI-generated, advisory)
 
-{ai_explanation}
+{rca}
 
 ## Verification and limitations
 
 - This report is based on evidence collected from the current Kubernetes cluster.
-- The AI explanation is advisory; verify recommendations before making changes.
-- This program did not restart, delete, or modify the pod.
+- The AI analysis is advisory; verify recommendations before making changes.
+- LW-RCA-analyzer did not restart, delete, or modify the pod.
 - Missing metrics or unavailable logs are reported as unavailable, not guessed.
 """
-    file_path.write_text(content, encoding="utf-8")
-    return str(file_path)
+
+    # 7. Save the file.
+    with open(file_path, "w", encoding="utf-8") as report_file:
+        report_file.write(content)
+    return file_path
